@@ -44,6 +44,19 @@ namespace ProxiFyre
 
             _socksify.LogEvent += NativeLogToNLog;
 
+            // Configure LAN bypass if enabled (upstream: BypassLan)
+            if (cfg.bypassLan == true)
+            {
+                _socksify.SetBypassLan();
+
+                if (_logLevel >= SLogLevel.Info)
+                {
+                    var msg = "LAN bypass enabled - local network traffic will not be proxied.";
+                    FileLog.Info(msg);
+                    Console.WriteLine($"INFO: {msg}");
+                }
+            }
+
             var anyAssociation = false;
 
             foreach (var rule in (cfg.proxies ?? new List<ProxyRule>()))
@@ -201,6 +214,9 @@ namespace ProxiFyre
             public string logLevel { get; set; } = "Info";
             public List<ProxyRule> proxies { get; set; } = new List<ProxyRule>();
             public List<string> excludes { get; set; } = new List<string>();
+
+            [JsonProperty("bypassLan", NullValueHandling = NullValueHandling.Ignore)]
+            public bool? bypassLan { get; set; } = false;
         }
 
         private class ProxyRule

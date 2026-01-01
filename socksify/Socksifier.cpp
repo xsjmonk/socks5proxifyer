@@ -139,6 +139,27 @@ bool Socksifier::Socksifier::Stop()
     return false;
 }
 
+/// <summary>
+/// Enables LAN traffic bypass.
+/// When enabled, traffic to/from local network ranges will pass through without being proxied.
+/// </summary>
+void Socksifier::Socksifier::SetBypassLan()
+{
+    if (unmanaged_ptr_)
+    {
+        unmanaged_ptr_->set_bypass_lan();
+    }
+}
+
+/// <summary>
+/// Adds a SOCKS5 proxy to the gateway.
+/// </summary>
+/// <param name="endpoint">The proxy endpoint (IP:Port).</param>
+/// <param name="username">The username for authentication.</param>
+/// <param name="password">The password for authentication.</param>
+/// <param name="protocols">The supported protocols.</param>
+/// <param name="start">Whether to start the proxy immediately.</param>
+/// <returns>A handle to the proxy instance, or -1 on failure.</returns>
 IntPtr Socksifier::Socksifier::AddSocks5Proxy(String^ endpoint, String^ username, String^ password,
     SupportedProtocolsEnum protocols, const bool start)
 {
