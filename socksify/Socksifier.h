@@ -154,8 +154,40 @@ namespace Socksifier
         bool Start();
         bool Stop();
 
-        IntPtr AddSocks5Proxy(String^ endpoint, String^ username, String^ password,
-                              SupportedProtocolsEnum protocols, bool start);
+        /// <summary>
+        /// Enables LAN traffic bypass.
+        /// When enabled, traffic to/from local network ranges will pass through without being proxied.
+        /// </summary>
+        /// <remarks>
+        /// This must be called before Start() to take effect.
+        /// 
+        /// Bypassed ranges:
+        /// - 10.0.0.0/8 (Private Class A)
+        /// - 172.16.0.0/12 (Private Class B: 172.16.x.x - 172.31.x.x)
+        /// - 192.168.0.0/16 (Private Class C)
+        /// - 224.0.0.0/4 (Multicast: 224.x.x.x - 239.x.x.x)
+        /// - 169.254.0.0/16 (Link-local / APIPA)
+        /// </remarks>
+        void SetBypassLan();
+
+        /// <summary>
+        /// Adds a SOCKS5 proxy to the gateway.
+        /// </summary>
+        /// <param name="endpoint">The proxy endpoint (IP:Port).</param>
+        /// <param name="username">The username for authentication.</param>
+        /// <param name="password">The password for authentication.</param>
+        /// <param name="protocols">The supported protocols.</param>
+        /// <param name="start">Whether to start the proxy immediately.</param>
+        /// <returns>A handle to the proxy instance.</returns>
+        IntPtr AddSocks5Proxy(String^ endpoint, String^ username, String^ password, SupportedProtocolsEnum protocols,
+            bool start);
+
+        /// <summary>
+        /// Associates a process name with a specific proxy.
+        /// </summary>
+        /// <param name="processName">The process name to associate.</param>
+        /// <param name="proxy">The proxy handle.</param>
+        /// <returns>True if association was successful, otherwise false.</returns>
         bool AssociateProcessNameToProxy(String^ processName, IntPtr proxy);
         bool ExcludeProcessName(String^ excludedEntry);
 

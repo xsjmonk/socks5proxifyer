@@ -175,6 +175,18 @@ bool socksify_unmanaged::stop() const
 }
 
 /**
+ * @brief Enables LAN traffic bypass.
+ * When enabled, traffic to/from local network ranges will pass through without being proxied.
+ */
+void socksify_unmanaged::set_bypass_lan() const
+{
+    if (proxy_)
+    {
+        proxy_->set_bypass_lan();
+    }
+}
+
+/**
  * @brief Adds a SOCKS5 proxy to the gateway.
  */
 LONG_PTR socksify_unmanaged::add_socks5_proxy(
