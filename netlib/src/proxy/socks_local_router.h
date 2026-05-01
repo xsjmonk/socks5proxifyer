@@ -40,9 +40,66 @@ namespace proxy
         using s5_udp_proxy_server = socks5_local_udp_proxy_server<socks5_udp_proxy_socket<net::ip_address_v4>>;
 
         /**
-         * @brief Stores a mapping of TCP ports to their corresponding IP endpoints.
+         * @brief Entry stored in tcp_mapper_: redirected destination endpoint and the
+         *        steady-clock timestamp at which the mapping was created. The timestamp
+         *        is used by process_resolve_thread_proc to evict stale entries whose
+         *        SYN never produced a local proxy connection (e.g. RST/timeout).
          */
-        std::unordered_map<uint16_t, net::ip_endpoint<net::ip_address_v4>> tcp_mapper_;
+        struct tcp_mapper_entry
+        {
+            net::ip_endpoint<net::ip_address_v4> endpoint;
+            std::chrono::steady_clock::time_point created_at;
+        };
+
+        /**
+         * @brief Stores a mapping of TCP source ports to their original destination
+         *        endpoints, stamped with the time the entry was created so stale
+         *        entries can be aged out.
+         */
+        std::unordered_map<uint16_t, tcp_mapper_entry> tcp_mapper_;
+
+        /**
+         * @brief Maximum age for a tcp_mapper_ entry before it is considered stale and
+         *        evicted by the resolve thread. SYN packets that never reach the local
+         *        SOCKS5 server (e.g. RST'd, dropped, app gave up) would otherwise leak
+         *        entries indefinitely.
+         */
+        static constexpr std::chrono::seconds tcp_mapper_entry_ttl_{ 30 };
+
+        /**
+         * @brief Maximum number of packets that may be queued for deferred process
+         *        resolution before new packets are dropped. Bounds memory growth of
+         *        process_resolve_buffer_queue_ (and therefore the intermediate buffer
+         *        pool) when the single-threaded resolver cannot keep up with the
+         *        incoming packet rate.
+         */
+        static constexpr std::size_t max_resolve_queue_depth_ = 2048;
+
+        /**
+         * @brief Minimum interval between consecutive drop-counter warning logs from
+         *        the resolver thread. The cumulative dropped count is preserved
+         *        between emissions, so no information is lost — only the log rate
+         *        is throttled to avoid flooding under sustained overload where
+         *        resolver drain cycles can fire many times per second.
+         */
+        static constexpr std::chrono::seconds drop_log_throttle_interval_{ 5 };
+
+        /**
+         * @brief Cumulative count of TCP/UDP packets dropped because
+         *        process_resolve_buffer_queue_ was full. Sampled and logged at a
+         *        coarse rate from the resolver thread to avoid log floods under
+         *        sustained overload.
+         */
+        std::atomic<std::uint64_t> resolve_queue_dropped_packets_{ 0 };
+
+        /**
+         * @brief Cumulative count of TCP/UDP packets dropped because the intermediate
+         *        buffer pool failed to allocate. Reported alongside
+         *        resolve_queue_dropped_packets_ via the same time-throttled log path
+         *        in the resolver thread, avoiding a per-failure log line under
+         *        memory pressure.
+         */
+        std::atomic<std::uint64_t> resolve_queue_alloc_failures_{ 0 };
 
         /**
          * @brief Stores the set of UDP ports being mapped.
@@ -88,6 +145,19 @@ namespace proxy
          * @brief Shared mutex to protect concurrent access to shared resources.
          */
         std::shared_mutex lock_;
+
+        /**
+         * @brief Serializes lifecycle operations (start(), stop(), and
+         * add_socks5_proxy()) so that proxies cannot be created/started
+         * concurrently with start()/stop() bookkeeping. Without this guard,
+         * a proxy added via add_socks5_proxy() could slip into proxy_servers_
+         * after a start() failure-cleanup snapshot is captured but before the
+         * stop loop runs, leaving a started proxy that the cleanup misses.
+         * This mutex is intentionally NOT held by the resolver thread or by
+         * proxy cleanup threads, so it does not introduce new deadlock paths
+         * with the existing lock_ ordering.
+         */
+        std::mutex lifecycle_mutex_;
 
         /**
          * @brief Unique pointer to the TCP redirect object.
@@ -176,6 +246,107 @@ namespace proxy
         */
         std::atomic_bool is_active_{ false };
 
+        /**
+         * @brief Atomic flag that signals the deferred-resolve thread to exit.
+         *
+         * Set to true only after the packet filter has been fully stopped (so no
+         * more enqueue_for_deferred_resolve calls can race the resolver thread's
+         * exit decision). Kept distinct from is_active_ because stop() clears
+         * is_active_ before stopping the packet filter, and the packet handler
+         * thread can therefore still produce queued buffers while is_active_ is
+         * already false. Gating the resolver's shutdown break on this flag (and
+         * not on is_active_) ensures any buffers enqueued before stop_filter()
+         * returns are still drained.
+         */
+        std::atomic_bool resolver_should_exit_{ false };
+
+        /**
+         * @brief Enqueues a TCP/UDP packet for deferred process resolution, dropping
+         *        it if process_resolve_buffer_queue_ is already at capacity.
+         *
+         * Bounding the queue is what keeps the intermediate buffer pool's high-water
+         * mark finite when the resolver thread cannot keep up with the incoming
+         * packet rate. The capacity check is performed under
+         * process_resolve_buffer_mutex_ before allocating from the pool so an
+         * overload condition does not produce unnecessary buffer-pool churn.
+         * The queued_multi_interface_packet_filter callback path drives this
+         * function from a single packet processing thread, so the size check
+         * and subsequent push are not racing other filter callbacks; the
+         * implementation does not rely on exceeding max_resolve_queue_depth_
+         * to remain bounded under concurrency.
+         *
+         * Defined in the private section above the constructor so its declaration
+         * is in scope for the packet_filter callback lambda constructed in the
+         * constructor body, regardless of compiler treatment of complete-class
+         * context for member name lookup inside lambdas.
+         *
+         * @param buffer The intermediate buffer describing the packet to enqueue.
+         * @return Always returns a 'drop' action: the packet is either queued for
+         *         later re-injection (and therefore dropped from the current pass)
+         *         or dropped outright due to overload / allocation failure.
+         */
+        packet_filter::packet_action enqueue_for_deferred_resolve(ndisapi::intermediate_buffer& buffer)
+        {
+            {
+                std::scoped_lock lock(process_resolve_buffer_mutex_);
+                if (process_resolve_buffer_queue_.size() >= max_resolve_queue_depth_)
+                {
+                    // The increment occurs while holding process_resolve_buffer_mutex_
+                    // so this full-queue drop path is not expected to undercount due
+                    // to contention. Treat the counter as a coarse overload signal
+                    // rather than precise end-to-end accounting; if the
+                    // single-callback-thread assumption changes in the future, the
+                    // more likely concurrency artifact would be temporary queue
+                    // overshoot from the unlocked allocation window below, not
+                    // missed increments in this branch.
+                    resolve_queue_dropped_packets_.fetch_add(1, std::memory_order_relaxed);
+                    return packet_filter::packet_action{ packet_filter::packet_action::action_type::drop };
+                }
+            }
+
+            if (auto allocated_buffer = ndisapi::intermediate_buffer_pool::instance().allocate(buffer))
+            {
+                bool pushed = false;
+                {
+                    std::scoped_lock lock(process_resolve_buffer_mutex_);
+                    // Re-check capacity under the lock so the depth bound is
+                    // enforced strictly even if multiple producers ever drive
+                    // this path concurrently in the future. The allocation
+                    // window above is unlocked, so without this re-check the
+                    // queue could transiently exceed max_resolve_queue_depth_.
+                    if (process_resolve_buffer_queue_.size() < max_resolve_queue_depth_)
+                    {
+                        process_resolve_buffer_queue_.push(std::move(allocated_buffer));
+                        pushed = true;
+                    }
+                    else
+                    {
+                        resolve_queue_dropped_packets_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                if (pushed)
+                    process_resolve_buffer_queue_cv_.notify_one();
+                // allocated_buffer falls out of scope here and is returned to the
+                // pool automatically when not pushed.
+            }
+            else
+            {
+                // Treat allocation failure as a drop and account for it via a
+                // dedicated counter so it is surfaced through the resolver
+                // thread's time-throttled log path. Avoids emitting a log line
+                // per failure under memory pressure, which could itself flood.
+                resolve_queue_alloc_failures_.fetch_add(1, std::memory_order_relaxed);
+
+                // Wake the resolver thread even when the queue remains empty
+                // so allocation-failure diagnostics are not delayed until the
+                // next timed maintenance wakeup. The drop-log path itself is
+                // still throttled by drop_log_throttle_interval_, so a flood
+                // of failures cannot translate into a flood of log lines.
+                process_resolve_buffer_queue_cv_.notify_one();
+            }
+            return packet_filter::packet_action{ packet_filter::packet_action::action_type::drop };
+        }
+
     public:
         enum supported_protocols : uint8_t
         {
@@ -243,21 +414,7 @@ namespace proxy
                         {
                             return result.value();
                         }
-                        // Queue for the later processing
-                        if (auto allocated_buffer = ndisapi::intermediate_buffer_pool::instance().allocate(buffer))
-                        {
-                            {
-                                std::scoped_lock lock(process_resolve_buffer_mutex_);
-                                process_resolve_buffer_queue_.push(std::move(allocated_buffer));
-                            }
-                            process_resolve_buffer_queue_cv_.notify_one();
-                        }
-                        else
-                        {
-                            // Handle the error, e.g., log it or take corrective action
-                            NETLIB_LOG(log_level::error, "Failed to allocate buffer.");
-                        }
-                        return packet_filter::packet_action{ packet_filter::packet_action::action_type::drop };
+                        return enqueue_for_deferred_resolve(buffer);
                     }
 
                     if (ip_header->ip_p == IPPROTO_TCP)
@@ -266,21 +423,7 @@ namespace proxy
                         {
                             return result.value();
                         }
-                        // Queue for the later processing
-                        if (auto allocated_buffer = ndisapi::intermediate_buffer_pool::instance().allocate(buffer))
-                        {
-                            {
-                                std::scoped_lock lock(process_resolve_buffer_mutex_);
-                                process_resolve_buffer_queue_.push(std::move(allocated_buffer));
-                            }
-                            process_resolve_buffer_queue_cv_.notify_one();
-                        }
-                        else
-                        {
-                            // Handle the error, e.g., log it or take corrective action
-                            NETLIB_LOG(log_level::error, "Failed to allocate buffer.");
-                        }
-                        return packet_filter::packet_action{ packet_filter::packet_action::action_type::drop };
+                        return enqueue_for_deferred_resolve(buffer);
                     }
 
                     return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
@@ -358,15 +501,34 @@ namespace proxy
          */
         bool start()
         {
+            // Serialize lifecycle operations (start/stop/add_socks5_proxy) so
+            // that a concurrent add_socks5_proxy() cannot register a started
+            // proxy after the failure-cleanup snapshot has been captured.
+            std::scoped_lock lifecycle_lock(lifecycle_mutex_);
+
             if (auto expected = false; !is_active_.compare_exchange_strong(expected, true))
             {
                 NETLIB_LOG(log_level::error, "Filter is already active!");
                 return false;
             }
 
+            // Reset resolver-exit signal on every start so a previous
+            // stop()/start() cycle does not leave the new resolver thread
+            // pre-armed to exit. Also reset the drop/alloc-failure counters
+            // so they reflect this run rather than leaking stale counts from
+            // a prior stop()/start() cycle.
+            resolver_should_exit_.store(false);
+            resolve_queue_dropped_packets_.store(0, std::memory_order_relaxed);
+            resolve_queue_alloc_failures_.store(0, std::memory_order_relaxed);
+
             if (!packet_filter_)
             {
                 NETLIB_LOG(log_level::error, "Packet filter is not initialized!");
+                // Roll back is_active_ so subsequent stop()/start() cycles see
+                // a consistent inactive router state. The resolver thread has
+                // not been started yet on this path, so resolver_should_exit_
+                // does not need to be touched (it was just reset above).
+                is_active_.store(false);
                 return false;
             }
 
@@ -413,38 +575,54 @@ namespace proxy
             {
                 NETLIB_LOG(log_level::error, "Failed to start NDIS packet filter");
 
-                // Attempt to cancel notification of IP interface changes
+                // Attempt to cancel notification of IP interface changes.
+                // Log on failure but continue with cleanup either way: the
+                // packet filter never started, so proxies, the IOCP thread
+                // pool, and the resolver thread must all be torn down
+                // regardless of whether cancel_notify_ip_interface_change
+                // succeeded.
                 if (!this->cancel_notify_ip_interface_change())
                 {
-                    // Log an error if cancelling notification of IP interface changes failed
                     NETLIB_LOG(
                         log_level::error, "cancel_notify_ip_interface_change has failed, lasterror: {}",
                         GetLastError());
-
-                    std::shared_lock lock(lock_);
-
-                    // Stop all proxies
-                    for (auto& [tcp, udp] : proxy_servers_)
-                    {
-                        // Stop TCP proxy
-                        if (tcp)
-                            tcp->stop();
-
-                        // Stop UDP proxy
-                        if (udp)
-                            udp->stop();
-                    }
-
-                    // Stop the thread pool associated with the I/O completion port
-                    io_port_.stop_thread_pool();
-
-                    is_active_.store(false);
-
-                    process_resolve_buffer_queue_cv_.notify_all();
-
-                    if (process_resolve_thread_.joinable())
-                        process_resolve_thread_.join();
                 }
+
+                // Collect raw proxy pointers under lock_ but stop them outside
+                // the lock. Proxy cleanup threads may need to acquire the
+                // same mutex, so holding lock_ across stop() can deadlock.
+                // This mirrors the pattern used in stop().
+                std::vector<std::pair<s5_tcp_proxy_server*, s5_udp_proxy_server*>> proxies_to_stop;
+                {
+                    std::shared_lock lock(lock_);
+                    proxies_to_stop.reserve(proxy_servers_.size());
+                    for (auto& [tcp, udp] : proxy_servers_)
+                        proxies_to_stop.emplace_back(tcp.get(), udp.get());
+                }
+
+                // Stop all proxies without holding lock_.
+                for (auto& [tcp, udp] : proxies_to_stop)
+                {
+                    if (tcp)
+                        tcp->stop();
+
+                    if (udp)
+                        udp->stop();
+                }
+
+                // Stop the thread pool associated with the I/O completion port.
+                io_port_.stop_thread_pool();
+
+                is_active_.store(false);
+
+                // The packet filter never started in this error branch, so
+                // no callback thread can still be enqueuing — safe to
+                // signal resolver shutdown directly.
+                resolver_should_exit_.store(true);
+                process_resolve_buffer_queue_cv_.notify_all();
+
+                if (process_resolve_thread_.joinable())
+                    process_resolve_thread_.join();
             }
 
             return is_active_;
@@ -463,6 +641,11 @@ namespace proxy
          */
         bool stop()
         {
+            // Serialize lifecycle operations (start/stop/add_socks5_proxy) so
+            // that an add_socks5_proxy() cannot interleave with the teardown
+            // sequence below and leave a started proxy outside the stop loop.
+            std::scoped_lock lifecycle_lock(lifecycle_mutex_);
+
             // A flag to indicate whether the operation was active or not.
             // If the value of is_active_ was already false, this function returns false
             if (auto expected = true; !is_active_.compare_exchange_strong(expected, false))
@@ -474,8 +657,14 @@ namespace proxy
             packet_filter_->stop_filter();
 
             // Step 2: Signal and join the process resolve thread
-            // This ensures no more packets are being queued for processing
+            // This ensures no more packets are being queued for processing.
+            // resolver_should_exit_ is set only AFTER stop_filter() returns
+            // so the resolver thread cannot observe an exit signal while the
+            // packet handler thread is still potentially enqueuing buffers,
+            // which would otherwise leave them stranded in
+            // process_resolve_buffer_queue_.
             NETLIB_DEBUG("Stopping process resolve thread");
+            resolver_should_exit_.store(true);
             process_resolve_buffer_queue_cv_.notify_all();
 
             if (process_resolve_thread_.joinable())
@@ -611,7 +800,10 @@ namespace proxy
         {
             using namespace std::string_literals;
 
-            // Parse the endpoint to an IP address and port number
+            // Parse the endpoint to an IP address and port number. This may
+            // perform a blocking DNS lookup via getaddrinfo, so it is
+            // intentionally done OUTSIDE lifecycle_mutex_ so that a concurrent
+            // start()/stop() cannot be stalled by name resolution.
             auto proxy_endpoint = parse_endpoint(endpoint);
 
             // If parsing failed, log the error and return nullopt
@@ -620,6 +812,14 @@ namespace proxy
                 NETLIB_LOG(log_level::error, "Failed to parse the proxy endpoint {}", endpoint);
                 return {};
             }
+
+            // Serialize the lifecycle-state mutations (filter list, proxy
+            // construction/start, and proxy_servers_ insertion) against
+            // start()/stop() so that this function cannot register/start a
+            // proxy concurrently with start() failure cleanup (which would
+            // otherwise leave a running proxy that the cleanup snapshot of
+            // proxy_servers_ has already missed) or with stop().
+            std::scoped_lock lifecycle_lock(lifecycle_mutex_);
 
             // Construct filter objects for the TCP and UDP traffic to and from the proxy server
             // These filters are used to decide which packets to pass or drop
@@ -677,12 +877,27 @@ namespace proxy
                                                           if (const auto it = tcp_mapper_.find(port); it != tcp_mapper_.
                                                               end())
                                                           {
+                                                              // Discard stale entries whose age has exceeded the TTL.
+                                                              // Eviction is performed asynchronously by the resolver
+                                                              // thread and may be delayed, so validate age at lookup
+                                                              // time to avoid misrouting a new connection on a reused
+                                                              // source port.
+                                                              if (std::chrono::steady_clock::now() - it->second.created_at
+                                                                  > tcp_mapper_entry_ttl_)
+                                                              {
+                                                                  NETLIB_LOG(log_level::warning,
+                                                                            "TCP Redirect entry for port {} was stale (age exceeded TTL); discarding.",
+                                                                            port);
+                                                                  tcp_mapper_.erase(it);
+                                                                  return std::make_tuple(net::ip_address_v4{}, 0, nullptr);
+                                                              }
+
                                                               NETLIB_LOG(log_level::info,
                                                                         "TCP Redirect entry was found for the {} : {} is {} : {}",
-                                                                        address, port, net::ip_address_v4{it->second.ip}, it->second.port);
+                                                                        address, port, net::ip_address_v4{it->second.endpoint.ip}, it->second.endpoint.port);
 
-                                                              auto remote_address = it->second.ip;
-                                                              auto remote_port = it->second.port;
+                                                              auto remote_address = it->second.endpoint.ip;
+                                                              auto remote_port = it->second.endpoint.port;
 
                                                               tcp_mapper_.erase(it);
 
@@ -1233,8 +1448,11 @@ namespace proxy
                 {
                     std::scoped_lock lock(tcp_mapper_lock_);
                     tcp_mapper_[ntohs(tcp_header->th_sport)] =
-                        net::ip_endpoint(net::ip_address_v4(ip_header->ip_dst),
-                            ntohs(tcp_header->th_dport));
+                        tcp_mapper_entry{
+                            net::ip_endpoint(net::ip_address_v4(ip_header->ip_dst),
+                                ntohs(tcp_header->th_dport)),
+                            std::chrono::steady_clock::now()
+                        };
 
                     NETLIB_LOG(log_level::info,
                         "Redirecting TCP: {} : {} -> {} : {}",
@@ -1323,14 +1541,17 @@ namespace proxy
         * processing by using local queues and minimizing lock contention.
         *
         * The main steps are:
-        * 1. Wait for packets to be queued or for the router to become inactive.
+        * 1. Wait for packets to be queued or for resolver_should_exit_ to be set.
         * 2. Swap the shared queue with a local queue for processing.
         * 3. Refresh the process lookup table.
         * 4. For each packet, attempt to resolve the process and determine the appropriate
         *    action (pass to adapter, revert to MSTCP, or assert on unexpected cases).
         * 5. Send processed packets to their respective destinations and clear local queues.
         *
-        * The thread exits when the router is deactivated and the queue is empty.
+        * The thread exits only after resolver_should_exit_ has been set (which stop()
+        * does after packet_filter_->stop_filter() returns) and the shared queue has
+        * fully drained, so any buffers enqueued by the packet-handler thread before
+        * stop_filter() completes are still processed before the resolver thread exits.
         */
         void process_resolve_thread_proc()
         {
@@ -1339,19 +1560,154 @@ namespace proxy
             std::vector<ndisapi::intermediate_buffer_pool::intermediate_buffer_ptr> to_adapters;
             std::vector<ndisapi::intermediate_buffer_pool::intermediate_buffer_ptr> to_mstcp;
 
-            while (is_active_.load())
+            // Run the tcp_mapper_ sweep at most once per maintenance interval, even
+            // under heavy resolver activity. The interval is half the TTL so an
+            // entry is evicted within at most 1.5 * TTL of becoming stale, and the
+            // condition variable below uses the same period as its wait timeout so
+            // the sweep still runs when the deferred-resolve queue stays empty.
+            constexpr auto maintenance_interval = tcp_mapper_entry_ttl_ / 2;
+            auto last_sweep = std::chrono::steady_clock::now();
+            auto last_drop_log = last_sweep;
+
+            while (true)
             {
                 {
                     std::unique_lock lock(process_resolve_buffer_mutex_);
-                    process_resolve_buffer_queue_cv_.wait(lock, [this] {
-                        return !process_resolve_buffer_queue_.empty() || !is_active_.load();
+                    // Timed wait so we still run periodic maintenance (tcp_mapper_
+                    // TTL eviction) when no packets are being deferred. Also wake
+                    // early for maintenance-only notifications so throttled
+                    // alloc-failure/drop diagnostics are not delayed until the next
+                    // timeout when no packet was actually queued, but only once
+                    // the throttle window has elapsed to avoid a tight spin on
+                    // empty queues under sustained overload (the counters stay
+                    // non-zero until the throttled log path runs and exchanges
+                    // them, so waking unconditionally on non-zero counters would
+                    // re-fire every iteration until the throttle elapses).
+                    process_resolve_buffer_queue_cv_.wait_for(lock, maintenance_interval, [this, &last_drop_log] {
+                        if (!process_resolve_buffer_queue_.empty() || resolver_should_exit_.load())
+                            return true;
+
+                        const auto has_pending_drop_diagnostics =
+                            resolve_queue_alloc_failures_.load(std::memory_order_relaxed) != 0 ||
+                            resolve_queue_dropped_packets_.load(std::memory_order_relaxed) != 0;
+
+                        if (!has_pending_drop_diagnostics)
+                            return false;
+
+                        return std::chrono::steady_clock::now() - last_drop_log >= drop_log_throttle_interval_;
                         });
 
-                    if (!is_active_.load() && process_resolve_buffer_queue_.empty())
+                    if (resolver_should_exit_.load() && process_resolve_buffer_queue_.empty())
                         break;
 
                     // Swap the contents of the shared queue with the local queue
                     std::swap(process_resolve_buffer_queue_, local_queue);
+                }
+
+                // Evict stale tcp_mapper_ entries whose SYN was redirected but never
+                // produced a local proxy connection (e.g. peer RST, timeout, app gave
+                // up). Without this sweep such entries would leak indefinitely since
+                // the only other removal site is the SOCKS5 negotiate callback. The
+                // sweep is rate-limited to maintenance_interval to bound CPU cost
+                // when the resolver loop runs frequently under sustained load.
+                if (const auto now = std::chrono::steady_clock::now();
+                    now - last_sweep >= maintenance_interval)
+                {
+                    last_sweep = now;
+                    std::scoped_lock lock(tcp_mapper_lock_);
+                    for (auto it = tcp_mapper_.begin(); it != tcp_mapper_.end();)
+                    {
+                        if (now - it->second.created_at > tcp_mapper_entry_ttl_)
+                        {
+                            it = tcp_mapper_.erase(it);
+                        }
+                        else
+                        {
+                            ++it;
+                        }
+                    }
+                }
+
+                // Periodically surface the counts of packets dropped due to a
+                // full resolve queue or buffer-pool allocation failure so
+                // operators can correlate connectivity issues with resolver
+                // overload / memory pressure. The emission is throttled to at
+                // most once per drop_log_throttle_interval_ — between
+                // emissions the cumulative counts keep accumulating in the
+                // atomic counters, so no drops are lost; only the log rate is
+                // bounded. Performed before the local_queue.empty() early-
+                // continue so the signal is still surfaced when the queue
+                // stays empty (e.g. resolver succeeds inline but allocations
+                // are failing). Relaxed ordering is sufficient because the
+                // counters are coarse overload indicators.
+                if (const auto now = std::chrono::steady_clock::now();
+                    now - last_drop_log >= drop_log_throttle_interval_)
+                {
+                    // Relaxed load fast-path: once the throttle interval has
+                    // elapsed, avoid performing atomic RMWs (exchange) on the
+                    // hot path when both counters are already zero. Only fall
+                    // through to the exchange/log path when at least one
+                    // counter has observed activity.
+                    const auto dropped_snapshot =
+                        resolve_queue_dropped_packets_.load(std::memory_order_relaxed);
+                    const auto alloc_failures_snapshot =
+                        resolve_queue_alloc_failures_.load(std::memory_order_relaxed);
+
+                    if ((dropped_snapshot != 0) || (alloc_failures_snapshot != 0))
+                    {
+                        bool emitted = false;
+                        if (dropped_snapshot != 0)
+                        {
+                            if (const auto dropped =
+                                    resolve_queue_dropped_packets_.exchange(0, std::memory_order_relaxed);
+                                dropped != 0)
+                            {
+                                NETLIB_LOG(log_level::warning,
+                                    "Dropped {} packet(s) because process_resolve_buffer_queue_ reached capacity at {} entries.",
+                                    dropped, max_resolve_queue_depth_);
+                                emitted = true;
+                            }
+                        }
+                        if (alloc_failures_snapshot != 0)
+                        {
+                            if (const auto alloc_failures =
+                                    resolve_queue_alloc_failures_.exchange(0, std::memory_order_relaxed);
+                                alloc_failures != 0)
+                            {
+                                NETLIB_LOG(log_level::error,
+                                    "Dropped {} packet(s) because the intermediate buffer pool failed to allocate.",
+                                    alloc_failures);
+                                emitted = true;
+                            }
+                        }
+                        // Only advance the throttle timestamp when something
+                        // was actually logged so that the throttle interval
+                        // bounds the minimum gap between *emitted* logs
+                        // rather than between throttle checks.
+                        if (emitted)
+                        {
+                            last_drop_log = now;
+                        }
+                    }
+                    else
+                    {
+                        // Both counters are zero: advance the throttle
+                        // timestamp so the throttle check (now() + atomic
+                        // loads) only runs at most once per
+                        // drop_log_throttle_interval_, instead of on every
+                        // resolver loop iteration once the interval has
+                        // elapsed. A subsequent counter increment is still
+                        // surfaced within at most one drop_log_throttle_interval_.
+                        last_drop_log = now;
+                    }
+                }
+
+                // Nothing else to do on a maintenance-only wakeup (timer fired with
+                // an empty queue) — skip process-lookup refresh until there is
+                // real packet work.
+                if (local_queue.empty())
+                {
+                    continue;
                 }
 
                 // Actualize process lookup before processing
