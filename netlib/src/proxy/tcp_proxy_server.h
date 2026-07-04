@@ -283,6 +283,22 @@ namespace proxy
 
             end_server_ = false;
 
+            // A prior stop() closes and INVALIDATES the listening socket, but it is created only
+            // in the constructor (create_server_socket()). The router reuses the same
+            // tcp_proxy_server objects across stop()/start() cycles, so without recreating the
+            // socket here start() would relaunch the worker threads around INVALID_SOCKET and the
+            // accept loop (WSAAccept) would exit immediately -- a "running" server that silently
+            // accepts nothing. Recreate it (and fail start() if that fails).
+            if (server_socket_ == static_cast<SOCKET>(INVALID_SOCKET))
+            {
+                if (!create_server_socket())
+                {
+                    NETLIB_ERROR("tcp_proxy_server::start: failed to recreate the listening socket");
+                    end_server_ = true;
+                    return false;
+                }
+            }
+
             sock_array_events_.reserve(connections_array_size);
 
             sock_array_events_.push_back(std::make_tuple(WSACreateEvent(),
@@ -317,44 +333,99 @@ namespace proxy
                             operation_guard& operator=(operation_guard&&) = delete;
                         } guard{ active_iocp_operations_ };
 
-                        // Check if server is shutting down
+                        auto io_context = static_cast<per_io_context_t*>(povlp);
+
+                        // Acquire the socket's strong reference under a SHARED server lock so
+                        // this read is serialized with clear_thread's release_self_references(),
+                        // which resets the same shared_ptr while clear_thread holds the EXCLUSIVE
+                        // server lock_. That removes the data race on the shared_ptr and prevents
+                        // the object being released/destroyed between this read and its use; the
+                        // captured strong ref then keeps the object alive for the rest of the
+                        // callback. A relay/negotiate context whose socket already released its
+                        // self-references reads null and safely no-ops; inject_io_write contexts
+                        // are heap-owned and always carry a strong ref, so they are still handled.
+                        decltype(io_context->proxy_socket_ptr) proxy_socket;
+                        proxy_io_operation io_operation;
+                        {
+                            std::shared_lock lock(lock_);
+                            proxy_socket = io_context->proxy_socket_ptr;
+                            io_operation = io_context->io_operation;
+                        }
+                        if (!proxy_socket && io_operation != proxy_io_operation::inject_io_write)
+                            return true;
+
+                        // Balance the io_posted() done when this overlapped op was posted: this
+                        // completion is a real delivery, so decrement the socket's outstanding-I/O
+                        // count exactly once on every exit path (error return, dispatch, throw).
+                        // For a counted relay/negotiate completion proxy_socket is always non-null
+                        // here (the early-return above drops null relay/negotiate contexts, and a
+                        // self-reference cannot have been released while the count is non-zero), so
+                        // the guard always decrements it. inject_io_write is currently unused, but
+                        // its heap context now carries a real shared_from_this() ref, so if revived
+                        // the guard would find a non-null proxy_socket and correctly balance the
+                        // inline io_posted(); the null tolerance is only a defensive fallback.
+                        using io_dec_socket_t = decltype(proxy_socket.get());
+                        struct io_dec_guard {
+                            io_dec_socket_t s;
+                            explicit io_dec_guard(io_dec_socket_t sock) : s(sock) {}
+                            ~io_dec_guard() { if (s) s->io_completed(); }
+                            io_dec_guard(const io_dec_guard&) = delete;
+                            io_dec_guard(io_dec_guard&&) = delete;
+                            io_dec_guard& operator=(const io_dec_guard&) = delete;
+                            io_dec_guard& operator=(io_dec_guard&&) = delete;
+                        } io_dec{ proxy_socket.get() };
+
+                        // Honor shutdown only after the decrement guard is armed: bailing here
+                        // (instead of before acquiring proxy_socket) still balances this
+                        // completion's io_posted() via io_dec, so a completion delivered while
+                        // stop() runs cannot leave outstanding_io_ stuck non-zero. We hold a strong
+                        // ref so io_context stays valid, and we still start no new work below.
                         if (end_server_.load(std::memory_order_acquire))
                             return false;
 
-                        auto io_context = static_cast<per_io_context_t*>(povlp);
-
                         if (!status || (status && (num_bytes == 0)))
                         {
-                            if ((io_context->io_operation == proxy_io_operation::relay_io_read) ||
-                                (io_context->io_operation == proxy_io_operation::negotiate_io_read))
+                            if ((io_operation == proxy_io_operation::relay_io_read) ||
+                                (io_operation == proxy_io_operation::negotiate_io_read))
                             {
-                                io_context->proxy_socket_ptr->close_client(true, io_context->is_local);
+                                // A graceful FIN (status == true, 0 bytes) on the DATA relay path is
+                                // a half-close: do NOT hard-close, which would CancelIoEx an in-flight
+                                // send and truncate already-received data. Drain it instead. Hard
+                                // errors (status == false) and any 0-byte negotiation read still abort
+                                // immediately.
+                                if (status && io_operation == proxy_io_operation::relay_io_read)
+                                {
+                                    proxy_socket->on_peer_read_shutdown(io_context->is_local);
+                                    return false;
+                                }
+
+                                proxy_socket->close_client(true, io_context->is_local);
                                 return false;
                             }
 
                             if (!status)
                             {
-                                io_context->proxy_socket_ptr->close_client(false, io_context->is_local);
+                                proxy_socket->close_client(false, io_context->is_local);
                                 return false;
                             }
                         }
 
-                        switch (io_context->io_operation)
+                        switch (io_operation)
                         {
                         case proxy_io_operation::relay_io_read:
-                            io_context->proxy_socket_ptr->process_receive_buffer_complete(num_bytes, io_context);
+                            proxy_socket->process_receive_buffer_complete(num_bytes, io_context);
                             break;
 
                         case proxy_io_operation::relay_io_write:
-                            io_context->proxy_socket_ptr->process_send_buffer_complete(num_bytes, io_context);
+                            proxy_socket->process_send_buffer_complete(num_bytes, io_context);
                             break;
 
                         case proxy_io_operation::negotiate_io_read:
-                            io_context->proxy_socket_ptr->process_receive_negotiate_complete(num_bytes, io_context);
+                            proxy_socket->process_receive_negotiate_complete(num_bytes, io_context);
                             break;
 
                         case proxy_io_operation::negotiate_io_write:
-                            io_context->proxy_socket_ptr->process_send_negotiate_complete(num_bytes, io_context);
+                            proxy_socket->process_send_negotiate_complete(num_bytes, io_context);
                             break;
 
                         case proxy_io_operation::inject_io_write:
@@ -387,6 +458,22 @@ namespace proxy
                     return false;
                 }
             }
+            else
+            {
+                // The throwaway registration socket could not be created, so no IOCP completion
+                // handler was registered and completion_key_ is unset. Launching the workers now
+                // would produce an inert server: every session's overlapped I/O would post but
+                // never complete, so outstanding_io_ never drains and sessions pin forever. Treat
+                // this exactly like an association failure and fail start().
+                NETLIB_ERROR("tcp_proxy_server::start: failed to create IOCP registration socket");
+                if (std::get<0>(sock_array_events_[0]) != WSA_INVALID_EVENT)
+                {
+                    WSACloseEvent(std::get<0>(sock_array_events_[0]));
+                }
+                sock_array_events_.clear();
+                end_server_ = true;
+                return false;
+            }
 
             proxy_server_ = std::thread(&tcp_proxy_server::start_proxy_thread, this);
             check_clients_thread_ = std::thread(&tcp_proxy_server::clear_thread, this);
@@ -400,10 +487,13 @@ namespace proxy
          *
          * This method performs a graceful shutdown of the proxy server by:
          * 1. Setting the end_server_ flag to signal shutdown
-         * 2. Closing the server socket, which causes pending I/O to complete with error
-         * 3. Waiting for all active IOCP operations to complete (tracked by atomic counter)
-         * 4. Joining background threads
-         * 5. Clearing resources
+         * 2. Closing the server socket, which causes pending accept/I/O to complete with error
+         * 3. Joining the worker threads so no new session is accepted/connected during teardown
+         * 4. Cancelling each proxy socket's pending I/O (close_client) so its posted operations abort
+         * 5. Waiting for every proxy socket's overlapped I/O to drain (per-socket outstanding count)
+         *    and for all IOCP callbacks to finish, then unregistering the IOCP handler
+         * 6. Releasing each socket's self-references and clearing the vector so the sockets destruct
+         *    (skipped on drain timeout to avoid freeing an io_context under an in-flight completion)
          *
          * The IOCP thread pool itself is managed by io_completion_port and will be 
          * properly shut down when the completion port is destroyed.
@@ -432,63 +522,146 @@ namespace proxy
                 ::WSASetEvent(std::get<0>(sock_array_events_[0]));
             }
 
-            // Step 2.5: Unregister the IOCP handler BEFORE waiting
-            if (completion_key_ != 0) {
-                (void)completion_port_.unregister_handler(completion_key_);
-                completion_key_ = 0;
-            }
+            // The IOCP handler stays registered until AFTER the drain below: close_client()'s aborted
+            // completions must still dispatch through it to release and decrement outstanding_io_,
+            // exactly as in the SOCKS5 UDP server. Unregistering here (as the old code did) would drop
+            // those completions, so outstanding_io_ would never reach zero and the drain would hang.
 
-            // Step 3: Wait for all active IOCP operations to complete
-            // The socket closure ensures pending operations complete quickly.
-            // The atomic counter ensures we wait until all in-flight operations finish.
-            // Use exponential backoff to avoid busy-waiting
             using namespace std::chrono_literals;
-            int wait_iterations = 0;
 
-            while (active_iocp_operations_.load(std::memory_order_acquire) > 0)
-            {
-                if (constexpr int max_wait_iterations = 100; ++wait_iterations > max_wait_iterations)
-                {
-                    // Log warning if we're taking too long
-                    NETLIB_WARNING("Timeout waiting for IOCP operations to complete. Active operations: {}",
-                        active_iocp_operations_.load(std::memory_order_relaxed));
-                    break;
-                }
-                
-                // Exponential backoff: 1ms, 2ms, 4ms, 8ms, ... up to 100ms
-                const auto wait_time = std::min(1ms * (1 << std::min(wait_iterations / 10, 6)), 100ms);
-                std::this_thread::sleep_for(wait_time);
-            }
-
-            // Step 4: Join background threads
+            // Step 3: Quiesce the server's worker threads before tearing sessions down, so no new
+            // session is accepted/connected and no concurrent cleanup mutates proxy_sockets_ during
+            // the drain. They all exit once end_server_ is set and the server socket is closed. This
+            // matters more than on the UDP side: TCP creates sessions in connect_to_remote_host_thread_,
+            // so a socket added after the drain declared success would be freed with I/O still pending.
             if (proxy_server_.joinable())
             {
                 proxy_server_.join();
             }
-
             if (check_clients_thread_.joinable())
             {
                 check_clients_thread_.join();
             }
-
             if (connect_to_remote_host_thread_.joinable())
             {
                 connect_to_remote_host_thread_.join();
             }
 
-            // Step 5: Clear resources
-            // Now safe because:
-            // - end_server_ is true, so IOCP lambda won't process new completions
-            // - Socket is closed, so no new I/O can be initiated
-            // - We waited for all active operations to complete
-            if (!sock_array_events_.empty())
+            // Step 4: Cancel every proxy socket's pending I/O so its posted operations complete
+            // (aborted) and stop pinning the socket. Keep the sockets in the vector for now -- they
+            // must stay alive until their in-flight completions drain. Merely clearing the vector
+            // does NOT destroy them: each socket's io_context members self-reference it, so the
+            // destructor would never run and the socket handles / armed recv would leak.
             {
-                sock_array_events_.clear();
+                std::unique_lock lock(lock_);
+                for (auto& entry : proxy_sockets_)
+                {
+                    if (entry)
+                    {
+                        entry->close_client(false, true);  // close local (also closes remote)
+                        entry->close_client(false, false); // ensure remote closed if local was already invalid
+                    }
+                }
             }
 
-            if (!proxy_sockets_.empty())
+            // Step 5: Wait until every proxy socket has drained all posted overlapped I/O
+            // (outstanding_io_ == 0) AND no IOCP callback is still running. BOTH conditions are
+            // load-bearing:
+            //  (a) a cancelled completion may be queued but not yet dispatched while
+            //      active_iocp_operations_ momentarily reads zero -- so we gate on the per-socket
+            //      count too, else a still-queued completion would touch a freed io_context; and
+            //  (b) a completion that entered the lambda just before end_server_ was set can re-post
+            //      I/O (io_posted -> outstanding_io_ +1) AFTER we read that socket's count as zero.
+            //      That re-post happens strictly inside the lambda body, where active_iocp_operations_
+            //      is >= 1 (decremented only at scope exit, after the re-post), so requiring
+            //      active_iocp_operations_ == 0 keeps the combined gate closed until no lambda is
+            //      mid-dispatch. (This holds only because every re-post site runs inside the lambda.)
+            // Releasing a socket's self-references while either could still reference its io_context
+            // would free it out from under a completion. Exponential backoff to avoid busy-waiting.
+            int wait_iterations = 0;
+            bool drained_ok = false;
+
+            while (true)
             {
-                proxy_sockets_.clear();
+                bool drained = true;
+                {
+                    std::unique_lock lock(lock_);
+                    for (auto& entry : proxy_sockets_)
+                    {
+                        if (entry && entry->outstanding_io() != 0)
+                        {
+                            drained = false;
+                            entry->close_client(false, true);  // idempotent re-cancel
+                            entry->close_client(false, false);
+                        }
+                    }
+                }
+
+                if (drained && active_iocp_operations_.load(std::memory_order_acquire) == 0)
+                {
+                    drained_ok = true;
+                    break;
+                }
+
+                if (constexpr int max_wait_iterations = 100; ++wait_iterations > max_wait_iterations)
+                {
+                    NETLIB_ERROR("Timeout waiting for proxy socket I/O to drain (active operations: {}); "
+                        "leaving sessions pinned to avoid freeing in-flight io_contexts",
+                        active_iocp_operations_.load(std::memory_order_relaxed));
+                    break;
+                }
+
+                // Exponential backoff: 1ms, 2ms, 4ms, 8ms, ... up to 100ms
+                const auto wait_time = std::min(1ms * (1 << std::min(wait_iterations / 10, 6)), 100ms);
+                std::this_thread::sleep_for(wait_time);
+            }
+
+            // Step 5b: Ensure no IOCP callback is still executing (it captures `this`) before we
+            // proceed, closing the server-UAF window on the timeout path. Lambdas are bounded work,
+            // so this reliably reaches zero; bound it as a last resort.
+            for (int active_wait = 0;
+                 active_iocp_operations_.load(std::memory_order_acquire) != 0;
+                 ++active_wait)
+            {
+                if (active_wait > 200)
+                {
+                    NETLIB_ERROR("IOCP callbacks still active ({}) after drain; proceeding may be unsafe",
+                        active_iocp_operations_.load(std::memory_order_relaxed));
+                    break;
+                }
+                std::this_thread::sleep_for(std::min(1ms * (1 << std::min(active_wait / 10, 6)), 100ms));
+            }
+
+            // Step 6: All completions processed (or timed out) -- unregister the IOCP handler so no
+            // further completion dispatches into this server.
+            if (completion_key_ != 0)
+            {
+                (void)completion_port_.unregister_handler(completion_key_);
+                completion_key_ = 0;
+            }
+
+            // Step 7: Clear resources. Only if the drain completed do we break each socket's
+            // self-references and clear the vector so the sockets (and their io_contexts) destruct.
+            // If the drain timed out, some op is still outstanding; releasing/clearing then would
+            // free an io_context a still-queued completion could dereference, so we deliberately
+            // leak those sessions instead (a bounded, shutdown-only leak) rather than risk a UAF.
+            {
+                std::unique_lock lock(lock_);
+
+                if (!sock_array_events_.empty())
+                {
+                    sock_array_events_.clear();
+                }
+
+                if (drained_ok && !proxy_sockets_.empty())
+                {
+                    for (auto& entry : proxy_sockets_)
+                    {
+                        if (entry)
+                            entry->release_self_references();
+                    }
+                    proxy_sockets_.clear();
+                }
             }
 
             // Note: The IOCP thread pool itself is managed by completion_port_ and will be
@@ -723,6 +896,19 @@ namespace proxy
             }
             else
             {
+                // Allow this AF_INET6 upstream socket to reach IPv4 SOCKS5 servers
+                // via IPv4-mapped addresses (e.g. ::ffff:127.0.0.1). ProxiFyre's
+                // IPv6 proxy path targets the configured (often IPv4) SOCKS5 server
+                // through its v4-mapped form, so the socket must be dual-stack.
+                DWORD v6_only = 0;
+                if (setsockopt(remote_socket, IPPROTO_IPV6, IPV6_V6ONLY,
+                    reinterpret_cast<const char*>(&v6_only), sizeof(v6_only)) == SOCKET_ERROR)
+                {
+                    NETLIB_WARNING("connect_to_remote_host: Failed to clear IPV6_V6ONLY on remote socket: {}",
+                        WSAGetLastError());
+                    // Continue: a v6-only socket still works for genuine IPv6 upstreams.
+                }
+
                 sockaddr_in6 sa_local{};
                 sa_local.sin6_family = address_type_t::af_type;
                 sa_local.sin6_port = htons(0);
@@ -753,6 +939,7 @@ namespace proxy
 
             // The client_service structure specifies the address family,
             // IP address, and port of the server to be connected to.
+            WSAEVENT tracked_event = WSA_INVALID_EVENT;
             {
                 std::scoped_lock lock(lock_);
 
@@ -787,8 +974,31 @@ namespace proxy
                     return false;
                 }
 
+                // Remember the event we just tracked so a synchronous connect() failure below can
+                // find and erase this entry (see undo_pending_entry).
+                tracked_event = std::get<0>(sock_array_events_.back());
+
                 WSASetEvent(std::get<0>(sock_array_events_[0]));
             }
+
+            // If connect() fails synchronously (below) the entry pushed above would otherwise
+            // linger forever: its event is never signaled (the socket is closed), so it
+            // permanently occupies one of the limited slots and leaks the WSAEVENT. After
+            // connections_array_size such failures the server rejects every new connection until
+            // it is restarted. Erase our entry on those paths.
+            auto undo_pending_entry = [this, tracked_event]()
+            {
+                std::scoped_lock lock(lock_);
+                for (auto it = sock_array_events_.begin(); it != sock_array_events_.end(); ++it)
+                {
+                    if (std::get<0>(*it) == tracked_event)
+                    {
+                        WSACloseEvent(std::get<0>(*it));
+                        sock_array_events_.erase(it);
+                        break;
+                    }
+                }
+            };
 
             NETLIB_DEBUG("connect_to_remote_host: Initiating connection to {}:{}", remote_ip, remote_port);
 
@@ -808,6 +1018,7 @@ namespace proxy
                         NETLIB_WARNING("connect_to_remote_host: IPv4 connect failed: {}", error);
                         shutdown(remote_socket, SD_BOTH);
                         closesocket(remote_socket);
+                        undo_pending_entry();
                         return false;
                     }
                     NETLIB_DEBUG("connect_to_remote_host: IPv4 connection in progress (WSAEWOULDBLOCK)");
@@ -832,6 +1043,7 @@ namespace proxy
                         NETLIB_WARNING("connect_to_remote_host: IPv6 connect failed: {}", error);
                         shutdown(remote_socket, SD_BOTH);
                         closesocket(remote_socket);
+                        undo_pending_entry();
                         return false;
                     }
                     else
@@ -931,6 +1143,20 @@ namespace proxy
                 if (end_server_ == true)
                     break;
 
+                // WaitForMultipleObjects can return WAIT_FAILED (0xFFFFFFFF) -- e.g. when a handle
+                // in the array has become invalid. An INFINITE wait never returns WAIT_TIMEOUT, but
+                // guard against any out-of-range value: using it as a vector index below would be a
+                // wild out-of-bounds access. Log, back off briefly to avoid a hot spin if the
+                // condition persists, and rebuild the wait set on the next iteration.
+                if (event_index == WAIT_FAILED || event_index >= wait_events.size())
+                {
+                    NETLIB_ERROR("connect_to_remote_host_thread: wait returned invalid index {} (last error {})",
+                        static_cast<unsigned long>(event_index), GetLastError());
+                    using namespace std::chrono_literals;
+                    std::this_thread::sleep_for(100ms);
+                    continue;
+                }
+
                 if (event_index != 0)
                 {
                     std::scoped_lock lock(lock_);
@@ -955,11 +1181,25 @@ namespace proxy
                             std::move(negotiate_ctx),
                             logger::log_level_, logger::log_stream_);
 
+                        // The socket now OWNS both handles: its destructor closes them if any step
+                        // below throws (stack-unwinding destroys `socket` before the catch runs).
+                        // Null the local copies so the catch does NOT close them a second time --
+                        // a double closesocket that, with handle recycling, could tear down an
+                        // unrelated socket. If make_shared itself had thrown we would not reach here,
+                        // and the catch would still correctly close the un-transferred handles.
+                        local_socket = INVALID_SOCKET;
+                        remote_socket = INVALID_SOCKET;
+
                         // Initialize I/O contexts - can throw std::bad_weak_ptr or std::runtime_error
                         socket->initialize_io_contexts();
 
-                        // Associate with completion port
-                        socket->associate_to_completion_port(completion_key_, completion_port_);
+                        // Associate with completion port. A false return means no completion handler
+                        // was registered (CreateIoCompletionPort failed, or completion_key_ is
+                        // invalid): the session's overlapped I/O would post but never complete, so
+                        // outstanding_io_ would never drain and the session would pin forever. Treat
+                        // it as a fatal init error so the catch tears the half-built session down.
+                        if (!socket->associate_to_completion_port(completion_key_, completion_port_))
+                            throw std::runtime_error("associate_to_completion_port failed");
 
                         // Start the socket
                         socket->start();
@@ -1010,8 +1250,10 @@ namespace proxy
                 }
             }
 
-            // cleanup on exit
-            std::shared_lock lock(lock_);
+            // cleanup on exit. Exclusive lock: this block MUTATES sock_array_events_
+            // (closes events/sockets and writes INVALID_SOCKET), so a shared (read) lock
+            // would be the wrong contract.
+            std::unique_lock lock(lock_);
 
             for (auto&& a : sock_array_events_)
             {

@@ -25,7 +25,9 @@ namespace proxy
         * - login_responded: Identification response received.
         * - password_sent: Username/password authentication sent.
         * - password_responded: Authentication response received.
-        * - connect_sent: CONNECT command sent to the proxy.
+         * - connect_reply_header: Waiting for the 4-byte CONNECT reply header.
+         * - connect_reply_domain_length: Waiting for the domain-name BND.ADDR length byte.
+         * - connect_reply_tail: Waiting for BND.ADDR/BND.PORT bytes.
         */
         enum class socks5_state : uint8_t
         {
@@ -34,7 +36,9 @@ namespace proxy
             login_responded,
             password_sent,
             password_responded,
-            connect_sent
+            connect_reply_header,
+            connect_reply_domain_length,
+            connect_reply_tail
         };
 
     public:
@@ -119,24 +123,46 @@ namespace proxy
          *   - If username/password authentication is required, validates credentials and sends the authentication request.
          *   - If no authentication is required, sends the CONNECT command to the proxy.
          * - On receiving the authentication response (password_sent state), checks for success and sends the CONNECT command.
-         * - On receiving the CONNECT response (connect_sent state), checks for success and starts data relay if successful.
+         * - On receiving the CONNECT response header, checks for success, drains the variable-length
+         *   BND.ADDR/BND.PORT fields, and starts data relay if successful.
          *
-         * @param io_size Number of bytes received (unused in this implementation).
+         * @param io_size Number of bytes received by the completed negotiation read.
          * @param io_context Pointer to the per-I/O context structure for the operation.
          */
         void process_receive_negotiate_complete(const uint32_t io_size, per_io_context_t* io_context) override
         {
             if (io_context->is_local == false)
             {
+                // Unlike the base handler and the relay completion handlers, this SOCKS5 override
+                // must guard the negotiation state (current_state_, ident_resp_, the negotiate
+                // io-contexts, remote_socket_) against a concurrent close_client()/stop() running
+                // on another IOCP thread. The IOCP dispatcher calls this handler WITHOUT holding
+                // lock_, so acquire it here. Every close_client() reachable from this handler uses
+                // the AlreadyLocked (<true>) form to avoid re-locking the non-recursive mutex; the
+                // lock is released before start_data_relay() (which locks internally).
+                std::unique_lock<std::mutex> lock(tcp_proxy_socket<T>::lock_);
+
                 if (current_state_ == socks5_state::login_sent)
                 {
+                    // The method-selection reply is 2 bytes but TCP may deliver it across multiple
+                    // completions. Accumulate before parsing; a short read otherwise reads a stale
+                    // ident_resp_.method (0 -> mis-parsed as NO-AUTH) and desyncs the handshake.
+                    ident_resp_received_ += io_size;
+                    if (ident_resp_received_ < sizeof(socks5_ident_resp))
+                    {
+                        static_cast<void>(start_negotiate_receive(
+                            reinterpret_cast<char*>(&ident_resp_) + ident_resp_received_,
+                            static_cast<ULONG>(sizeof(socks5_ident_resp)) - ident_resp_received_));
+                        return;
+                    }
+
                     current_state_ = socks5_state::login_responded;
 
                     if ((ident_resp_.version != 5) ||
                         (ident_resp_.method == 0xFF))
                     {
                         // SOCKS v5 identification or authentication failed
-                        tcp_proxy_socket<T>::close_client(true, false);
+                        tcp_proxy_socket<T>::close_client<true>(true, false);
                     }
                     else
                     {
@@ -156,7 +182,7 @@ namespace proxy
                                 // [SOCKS5]: associate_to_socks5_proxy: RFC 1928: X'02' USERNAME/PASSWORD is chosen but USERNAME exceeds maximum possible length
                                 )
                             {
-                                tcp_proxy_socket<T>::close_client(true, false);
+                                tcp_proxy_socket<T>::close_client<true>(true, false);
                             }
                             else
                             {
@@ -169,153 +195,245 @@ namespace proxy
                                     io_context_recv_negotiate_.wsa_buf.buf = reinterpret_cast<char*>(&ident_resp_);
                                     io_context_recv_negotiate_.wsa_buf.len = sizeof(socks5_ident_resp);
 
-                                    DWORD flags = 0;
-
-                                    if ((::WSASend(
+                                    if (this->post_send(
                                         tcp_proxy_socket<T>::remote_socket_,
                                         &io_context_send_negotiate_.wsa_buf,
-                                        1,
-                                        nullptr,
-                                        0,
-                                        &io_context_send_negotiate_,
-                                        nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
+                                        &io_context_send_negotiate_) == SOCKET_ERROR)
                                     {
-                                        tcp_proxy_socket<T>::close_client(false, false);
+                                        tcp_proxy_socket<T>::close_client<true>(false, false);
+                                        return;
                                     }
 
                                     current_state_ = socks5_state::password_sent;
+                                    ident_resp_received_ = 0; // reset for the 2-byte auth reply
 
-                                    if ((::WSARecv(
+                                    if (this->post_recv(
                                         tcp_proxy_socket<T>::remote_socket_,
                                         &io_context_recv_negotiate_.wsa_buf,
-                                        1,
-                                        nullptr,
-                                        &flags,
-                                        &io_context_recv_negotiate_,
-                                        nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
+                                        &io_context_recv_negotiate_) == SOCKET_ERROR)
                                     {
-                                        tcp_proxy_socket<T>::close_client(true, false);
+                                        tcp_proxy_socket<T>::close_client<true>(true, false);
                                     }
                                 }
                             }
                         }
                         else // NO AUTHENTICATION REQUIRED is chosen
                         {
-                            connect_request_.cmd = 1;
-                            connect_request_.reserved = 0;
-                            connect_request_.address_type = 1;
-                            connect_request_.dest_address = tcp_proxy_socket<T>::negotiate_ctx_->remote_address;
-                            connect_request_.dest_port = htons(tcp_proxy_socket<T>::negotiate_ctx_->remote_port);
-
-                            io_context_send_negotiate_.wsa_buf.buf = reinterpret_cast<char*>(&connect_request_);
-                            io_context_send_negotiate_.wsa_buf.len = sizeof(socks5_req<T>);
-                            io_context_recv_negotiate_.wsa_buf.buf = reinterpret_cast<char*>(&connect_response_);
-                            io_context_recv_negotiate_.wsa_buf.len = sizeof(socks5_resp<T>);
-
-                            DWORD flags = 0;
-
-                            if ((::WSASend(
-                                tcp_proxy_socket<T>::remote_socket_,
-                                &io_context_send_negotiate_.wsa_buf,
-                                1,
-                                nullptr,
-                                0,
-                                &io_context_send_negotiate_,
-                                nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
-                            {
-                                tcp_proxy_socket<T>::close_client(false, false);
-                            }
-
-                            current_state_ = socks5_state::connect_sent;
-
-                            if ((::WSARecv(
-                                tcp_proxy_socket<T>::remote_socket_,
-                                &io_context_recv_negotiate_.wsa_buf,
-                                1,
-                                nullptr,
-                                &flags,
-                                &io_context_recv_negotiate_,
-                                nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
-                            {
-                                tcp_proxy_socket<T>::close_client(true, false);
-                            }
+                            send_connect_request();
                         }
                     }
                 }
                 else if (current_state_ == socks5_state::password_sent)
                 {
+                    // Accumulate the 2-byte auth reply the same way (see login_sent).
+                    ident_resp_received_ += io_size;
+                    if (ident_resp_received_ < sizeof(socks5_ident_resp))
+                    {
+                        static_cast<void>(start_negotiate_receive(
+                            reinterpret_cast<char*>(&ident_resp_) + ident_resp_received_,
+                            static_cast<ULONG>(sizeof(socks5_ident_resp)) - ident_resp_received_));
+                        return;
+                    }
+
                     current_state_ = socks5_state::password_responded;
 
                     if (ident_resp_.method != 0)
                     {
                         // SOCKS v5 identification or authentication failed
-                        tcp_proxy_socket<T>::close_client(true, false);
+                        tcp_proxy_socket<T>::close_client<true>(true, false);
                     }
                     else
                     {
-                        connect_request_.cmd = 1;
-                        connect_request_.reserved = 0;
-                        if constexpr (address_type_t::af_type == AF_INET)
-                        {
-                            connect_request_.address_type = 1; // IPv4
-                        }
-                        else
-                        {
-                            connect_request_.address_type = 4; // IPv6
-                        }
-                        connect_request_.dest_address = tcp_proxy_socket<T>::negotiate_ctx_->remote_address;
-                        connect_request_.dest_port = htons(tcp_proxy_socket<T>::negotiate_ctx_->remote_port);
-
-                        io_context_send_negotiate_.wsa_buf.buf = reinterpret_cast<char*>(&connect_request_);
-                        io_context_send_negotiate_.wsa_buf.len = sizeof(socks5_req<T>);
-                        io_context_recv_negotiate_.wsa_buf.buf = reinterpret_cast<char*>(&connect_response_);
-                        io_context_recv_negotiate_.wsa_buf.len = sizeof(socks5_resp<T>);
-
-                        DWORD flags = 0;
-
-                        if ((::WSASend(
-                            tcp_proxy_socket<T>::remote_socket_,
-                            &io_context_send_negotiate_.wsa_buf,
-                            1,
-                            nullptr,
-                            0,
-                            &io_context_send_negotiate_,
-                            nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
-                        {
-                            tcp_proxy_socket<T>::close_client(false, false);
-                        }
-
-                        current_state_ = socks5_state::connect_sent;
-
-                        if ((::WSARecv(
-                            tcp_proxy_socket<T>::remote_socket_,
-                            &io_context_recv_negotiate_.wsa_buf,
-                            1,
-                            nullptr,
-                            &flags,
-                            &io_context_recv_negotiate_,
-                            nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
-                        {
-                            tcp_proxy_socket<T>::close_client(true, false);
-                        }
+                        send_connect_request();
                     }
                 }
-                else if (current_state_ == socks5_state::connect_sent)
+                else if (current_state_ == socks5_state::connect_reply_header)
                 {
-                    if (connect_response_.reply != 0)
+                    if (!accumulate_connect_reply(io_size, &connect_response_header_, sizeof(connect_response_header_)))
+                    {
+                        return;
+                    }
+
+                    if ((connect_response_header_.version != socks5_protocol_version) ||
+                        (connect_response_header_.reply != 0))
                     {
                         // SOCKS v5 connect failed
-                        tcp_proxy_socket<T>::close_client(true, false);
+                        tcp_proxy_socket<T>::close_client<true>(true, false);
+                        return;
                     }
-                    else
+
+                    switch (connect_response_header_.address_type)
                     {
-                        tcp_proxy_socket<T>::start_data_relay();
+                    case 1: // IPv4
+                        if (!start_connect_reply_receive(
+                            socks5_state::connect_reply_tail,
+                            connect_response_tail_.data(),
+                            4 + sizeof(unsigned short)))
+                        {
+                            return;
+                        }
+                        break;
+
+                    case 4: // IPv6
+                        if (!start_connect_reply_receive(
+                            socks5_state::connect_reply_tail,
+                            connect_response_tail_.data(),
+                            16 + sizeof(unsigned short)))
+                        {
+                            return;
+                        }
+                        break;
+
+                    case 3: // domain name: read the one-byte length first.
+                        if (!start_connect_reply_receive(
+                            socks5_state::connect_reply_domain_length,
+                            connect_response_tail_.data(),
+                            1))
+                        {
+                            return;
+                        }
+                        break;
+
+                    default:
+                        tcp_proxy_socket<T>::close_client<true>(true, false);
+                        break;
                     }
+                }
+                else if (current_state_ == socks5_state::connect_reply_domain_length)
+                {
+                    if (!accumulate_connect_reply(io_size, connect_response_tail_.data(), 1))
+                    {
+                        return;
+                    }
+
+                    const auto domain_length = connect_response_tail_[0];
+                    if (!start_connect_reply_receive(
+                        socks5_state::connect_reply_tail,
+                        connect_response_tail_.data() + 1,
+                        static_cast<ULONG>(domain_length + sizeof(unsigned short))))
+                    {
+                        return;
+                    }
+                }
+                else if (current_state_ == socks5_state::connect_reply_tail)
+                {
+                    if (!accumulate_connect_reply(io_size, connect_reply_buffer_, connect_reply_expected_))
+                    {
+                        return;
+                    }
+
+                    // start_data_relay() locks lock_ internally (via close_client on its error
+                    // paths), so release our lock first to avoid re-locking the non-recursive
+                    // mutex. This is the terminal action of the handler; no shared negotiation
+                    // state is touched afterwards.
+                    lock.unlock();
+                    tcp_proxy_socket<T>::start_data_relay();
                 }
             }
         }
 
     private:
+        struct socks5_resp_header
+        {
+            unsigned char version = socks5_protocol_version;
+            unsigned char reply{};
+            unsigned char reserved{};
+            unsigned char address_type{};
+        };
+
+        void reset_overlapped(per_io_context_t& io_context) noexcept
+        {
+            io_context.Internal = 0;
+            io_context.InternalHigh = 0;
+            io_context.Offset = 0;
+            io_context.OffsetHigh = 0;
+            io_context.hEvent = nullptr;
+        }
+
+        [[nodiscard]] bool start_negotiate_receive(void* const buffer, const ULONG length)
+        {
+            reset_overlapped(io_context_recv_negotiate_);
+            io_context_recv_negotiate_.wsa_buf.buf = static_cast<char*>(buffer);
+            io_context_recv_negotiate_.wsa_buf.len = length;
+
+            if (this->post_recv(
+                tcp_proxy_socket<T>::remote_socket_,
+                &io_context_recv_negotiate_.wsa_buf,
+                &io_context_recv_negotiate_) == SOCKET_ERROR)
+            {
+                // Only reached from process_receive_negotiate_complete, which holds lock_.
+                tcp_proxy_socket<T>::close_client<true>(true, false);
+                return false;
+            }
+
+            return true;
+        }
+
+        [[nodiscard]] bool start_connect_reply_receive(const socks5_state state, void* const buffer, const ULONG length)
+        {
+            current_state_ = state;
+            connect_reply_buffer_ = static_cast<unsigned char*>(buffer);
+            connect_reply_expected_ = length;
+            connect_reply_received_ = 0;
+            return start_negotiate_receive(buffer, length);
+        }
+
+        [[nodiscard]] bool accumulate_connect_reply(const uint32_t io_size, void* const buffer, const ULONG length)
+        {
+            connect_reply_received_ += io_size;
+            if (connect_reply_received_ >= length)
+            {
+                return true;
+            }
+
+            if (!start_negotiate_receive(
+                static_cast<unsigned char*>(buffer) + connect_reply_received_,
+                length - connect_reply_received_))
+            {
+                return false;
+            }
+
+            return false;
+        }
+
+        void send_connect_request()
+        {
+            connect_request_.cmd = 1;
+            connect_request_.reserved = 0;
+            if constexpr (address_type_t::af_type == AF_INET)
+            {
+                connect_request_.address_type = 1; // IPv4
+            }
+            else
+            {
+                connect_request_.address_type = 4; // IPv6
+            }
+            connect_request_.dest_address = tcp_proxy_socket<T>::negotiate_ctx_->remote_address;
+            connect_request_.dest_port = htons(tcp_proxy_socket<T>::negotiate_ctx_->remote_port);
+
+            reset_overlapped(io_context_send_negotiate_);
+            io_context_send_negotiate_.wsa_buf.buf = reinterpret_cast<char*>(&connect_request_);
+            io_context_send_negotiate_.wsa_buf.len = sizeof(socks5_req<T>);
+
+            if (this->post_send(
+                tcp_proxy_socket<T>::remote_socket_,
+                &io_context_send_negotiate_.wsa_buf,
+                &io_context_send_negotiate_) == SOCKET_ERROR)
+            {
+                // Only reached from process_receive_negotiate_complete, which holds lock_.
+                tcp_proxy_socket<T>::close_client<true>(false, false);
+                return;
+            }
+
+            if (!start_connect_reply_receive(
+                socks5_state::connect_reply_header,
+                &connect_response_header_,
+                sizeof(connect_response_header_)))
+            {
+                return;
+            }
+        }
+
         /**
          * @brief Internal state and buffers for SOCKS5 negotiation and connection.
          *
@@ -325,7 +443,7 @@ namespace proxy
          * - ident_req_: Buffer for the SOCKS5 identification request (supports up to 2 methods).
          * - ident_resp_: Buffer for the SOCKS5 identification response from the proxy.
          * - connect_request_: Buffer for the SOCKS5 CONNECT command request.
-         * - connect_response_: Buffer for the SOCKS5 CONNECT command response.
+         * - connect_response_header_/tail: Buffers for the variable-length SOCKS5 CONNECT response.
          * - username_auth_: Buffer for username/password authentication as per RFC 1929.
          *
          * These members are used to manage the asynchronous negotiation and authentication
@@ -335,11 +453,31 @@ namespace proxy
         per_io_context_t io_context_recv_negotiate_{ proxy_io_operation::negotiate_io_read, nullptr, false };
         per_io_context_t io_context_send_negotiate_{ proxy_io_operation::negotiate_io_write, nullptr, false };
 
+    public:
+        // Also release this class's two negotiation contexts when breaking the cycle. Public (like
+        // the base override) so the owning server's stop() can break the reference cycle at shutdown.
+        void release_self_references() noexcept override
+        {
+            tcp_proxy_socket<T>::release_self_references();
+            io_context_recv_negotiate_.proxy_socket_ptr.reset();
+            io_context_send_negotiate_.proxy_socket_ptr.reset();
+        }
+
+    private:
+
         socks5_state current_state_{ socks5_state::pre_login };
         socks5_ident_req<2> ident_req_{};
         socks5_ident_resp ident_resp_{};
         socks5_req<address_type_t> connect_request_;
-        socks5_resp<address_type_t> connect_response_;
+        socks5_resp_header connect_response_header_{};
+        std::array<unsigned char, 1 + socks5_username_max_length + sizeof(unsigned short)> connect_response_tail_{};
+        unsigned char* connect_reply_buffer_{ nullptr };
+        ULONG connect_reply_expected_{ 0 };
+        ULONG connect_reply_received_{ 0 };
+        // Bytes accumulated so far for a fixed 2-byte reply (method-selection / auth). TCP may
+        // split the 2 bytes across completions; without accumulating, a 1-byte read would be
+        // parsed as a complete reply against stale ident_resp_ contents.
+        ULONG ident_resp_received_{ 0 };
         socks5_username_auth username_auth_{};
 
     protected:
@@ -398,18 +536,12 @@ namespace proxy
                     io_context_recv_negotiate_.wsa_buf.buf = reinterpret_cast<char*>(&ident_resp_);
                     io_context_recv_negotiate_.wsa_buf.len = sizeof(socks5_ident_resp);
 
-                    DWORD flags = 0;
-
                     NETLIB_DEBUG("Sending SOCKS5 identification request ({} bytes)", socks5_ident_req_size);
 
-                    if ((::WSASend(
+                    if (this->post_send(
                         tcp_proxy_socket<T>::remote_socket_,
                         &io_context_send_negotiate_.wsa_buf,
-                        1,
-                        nullptr,
-                        0,
-                        &io_context_send_negotiate_,
-                        nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
+                        &io_context_send_negotiate_) == SOCKET_ERROR)
                     {
                         const auto error = WSAGetLastError();
                         NETLIB_ERROR("Failed to send SOCKS5 identification request: WSA error {}", error);
@@ -418,16 +550,13 @@ namespace proxy
                     }
 
                     current_state_ = socks5_state::login_sent;
+                    ident_resp_received_ = 0; // reset for the 2-byte method-selection reply
                     NETLIB_DEBUG("SOCKS5 identification request sent, waiting for response");
 
-                    if ((::WSARecv(
+                    if (this->post_recv(
                         tcp_proxy_socket<T>::remote_socket_,
                         &io_context_recv_negotiate_.wsa_buf,
-                        1,
-                        nullptr,
-                        &flags,
-                        &io_context_recv_negotiate_,
-                        nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
+                        &io_context_recv_negotiate_) == SOCKET_ERROR)
                     {
                         const auto error = WSAGetLastError();
                         NETLIB_ERROR("Failed to receive SOCKS5 identification response: WSA error {}", error);

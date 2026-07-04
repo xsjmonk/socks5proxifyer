@@ -203,6 +203,16 @@ namespace proxy
         /// Atomic flag indicating whether the session is ready for removal and cleanup.
         /// </summary>
         std::atomic_bool ready_for_removal_{ false };
+        bool removal_armed_ = false;  ///< Set on the first removal pass; the next pass releases the self-reference.
+
+        /// <summary>
+        /// Count of overlapped I/O operations posted on this socket that have not yet completed.
+        /// Incremented (io_posted) immediately before each WSARecv/WSASend/WSASendTo and decremented
+        /// (io_completed) once per completion, and on a synchronous post failure. is_ready_for_removal()
+        /// releases the self-reference only when this is zero -- a genuine "no completion can still
+        /// reference our io_context member" guarantee rather than a wall-clock grace.
+        /// </summary>
+        std::atomic<long> outstanding_io_{ 0 };
 
     public:
         /**
@@ -370,7 +380,82 @@ namespace proxy
          */
         void close_client()
         {
+            // Cancel pending I/O and close the sockets immediately so their queued completions
+            // drain and the handles are released, instead of waiting for a destructor that the
+            // per-I/O self-reference would otherwise prevent from ever running. Idempotent.
+            if (remote_socket_ != static_cast<SOCKET>(INVALID_SOCKET))
+            {
+                CancelIoEx(reinterpret_cast<HANDLE>(remote_socket_), nullptr);  // NOLINT(performance-no-int-to-ptr)
+                closesocket(remote_socket_);
+                remote_socket_ = INVALID_SOCKET;
+            }
+            if (socks_socket_ != static_cast<SOCKET>(INVALID_SOCKET))
+            {
+                CancelIoEx(reinterpret_cast<HANDLE>(socks_socket_), nullptr);  // NOLINT(performance-no-int-to-ptr)
+                closesocket(socks_socket_);
+                socks_socket_ = INVALID_SOCKET;
+            }
             ready_for_removal_.store(true);
+        }
+
+        // Overlapped-I/O accounting. io_posted() is called immediately before every WSARecv/
+        // WSASend/WSASendTo post on this socket; io_completed() is called once per completion (from
+        // the server IOCP handler) and on a synchronous post failure. See outstanding_io_.
+        void io_posted() noexcept { outstanding_io_.fetch_add(1, std::memory_order_acq_rel); }
+        void io_completed() noexcept { outstanding_io_.fetch_sub(1, std::memory_order_acq_rel); }
+
+        // Current count of overlapped I/O operations posted on this socket that have not yet
+        // completed. The server's stop() polls this for a precise per-socket drain before it
+        // releases self-references and destroys the socket.
+        [[nodiscard]] long outstanding_io() const noexcept { return outstanding_io_.load(std::memory_order_acquire); }
+
+        // Break the per-I/O self-reference (the recv context's strong ref back to this socket)
+        // so the object can finally be destroyed. Only safe once this socket's overlapped I/O
+        // has drained (outstanding_io() == 0) and no completion is in flight. Idempotent.
+        void release_self_reference() noexcept { io_context_recv_from_remote_.proxy_socket_ptr.reset(); }
+
+        // Post an overlapped WSARecv/WSASend/WSASendTo with I/O accounting: count the op before
+        // posting and undo the count if the post fails synchronously (no completion will arrive).
+        // Returns SOCKET_ERROR on a synchronous hard failure (the count was undone); otherwise
+        // returns 0 -- the post either completed inline or is pending (ERROR_IO_PENDING) and a
+        // completion will arrive to balance the count. Most relay/inject posts go through these
+        // wrappers; the two auto-ret WSARecv re-arm sites (process_receive_buffer_complete and
+        // start_data_relay) do the same io_posted()/io_completed() accounting inline. Either way
+        // every posted op is counted exactly once.
+        int post_recv(const SOCKET s, const LPWSABUF buf, const LPWSAOVERLAPPED ctx) noexcept
+        {
+            io_posted();
+            DWORD flags = 0;
+            if ((::WSARecv(s, buf, 1, nullptr, &flags, ctx, nullptr) == SOCKET_ERROR) &&
+                (ERROR_IO_PENDING != WSAGetLastError()))
+            {
+                io_completed();
+                return SOCKET_ERROR;
+            }
+            return 0;
+        }
+        int post_send(const SOCKET s, const LPWSABUF buf, const LPWSAOVERLAPPED ctx) noexcept
+        {
+            io_posted();
+            if ((::WSASend(s, buf, 1, nullptr, 0, ctx, nullptr) == SOCKET_ERROR) &&
+                (ERROR_IO_PENDING != WSAGetLastError()))
+            {
+                io_completed();
+                return SOCKET_ERROR;
+            }
+            return 0;
+        }
+        int post_sendto(const SOCKET s, const LPWSABUF buf, const LPWSAOVERLAPPED ctx,
+            const sockaddr* to, const int tolen) noexcept
+        {
+            io_posted();
+            if ((::WSASendTo(s, buf, 1, nullptr, 0, to, tolen, ctx, nullptr) == SOCKET_ERROR) &&
+                (ERROR_IO_PENDING != WSAGetLastError()))
+            {
+                io_completed();
+                return SOCKET_ERROR;
+            }
+            return 0;
         }
 
         /**
@@ -381,14 +466,36 @@ namespace proxy
          *
          * @return True if the socket should be removed, false otherwise.
          */
-        bool is_ready_for_removal() const
+        bool is_ready_for_removal()
         {
             using namespace std::chrono_literals;
 
-            if (ready_for_removal_.load() || (std::chrono::steady_clock::now() - timestamp_ > 5min))
-                return true;
+            if (!ready_for_removal_.load() && (std::chrono::steady_clock::now() - timestamp_ <= 5min))
+                return false;
 
-            return false;
+            // Ready (explicit close or idle timeout). Break the per-I/O self-reference cycle so
+            // the destructor can run, but only after a one-cycle grace. First pass: close the
+            // sockets so any still-armed overlapped I/O is cancelled. This MUST run before the
+            // drain gate below -- an idle session always has a WSARecv pending on the remote
+            // socket, so gating on outstanding_io_ first would return early forever and
+            // close_client() (the only thing that cancels that recv) would never run, so the
+            // I/O would never drain and the session would accumulate indefinitely.
+            if (!removal_armed_)
+            {
+                close_client(); // idempotent: cancels pending I/O and closes the sockets
+                removal_armed_ = true;
+                return false;
+            }
+
+            // Do not release the self-reference until every overlapped I/O we posted has
+            // completed. close_client() cancelled them on the arming pass above; each aborted
+            // completion decrements outstanding_io_. A nonzero count means a completion could
+            // still reference our io_context member after it (and this object) are freed.
+            if (outstanding_io_.load(std::memory_order_acquire) != 0)
+                return false;
+
+            release_self_reference();
+            return true;
         }
 
         /**
@@ -479,17 +586,19 @@ namespace proxy
                     NETLIB_DEBUG("process_receive_buffer_complete: {}:{} sending {} bytes to remote socket",
                         remote_peer_address_, remote_peer_port_, io_size);
 
-                    if ((::WSASend(
+                    if (post_send(
                         remote_socket_,
                         io_context_send_to_remote->wsa_buf.get(),
-                        1,
-                        nullptr,
-                        0,
-                        io_context_send_to_remote,
-                        nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
+                        io_context_send_to_remote) == SOCKET_ERROR)
                     {
                         const auto error = WSAGetLastError();
                         NETLIB_WARNING("process_receive_buffer_complete: WSASend to remote failed with error: {}", error);
+                        // A synchronously-failed post yields no IOCP completion, so
+                        // process_send_buffer_complete() will never run to release this heap
+                        // io_context. It holds a strong shared_from_this() reference, so leaving it
+                        // would pin this socket alive forever (defeating release_self_reference()).
+                        // Release it by hand, exactly as the completion path does.
+                        socks5_udp_per_io_context<T>::release_io_context(io_context_send_to_remote);
                         // Close connection to remote peer in case of error
                         close_client();
                     }
@@ -511,6 +620,15 @@ namespace proxy
 
                 NETLIB_DEBUG("process_receive_buffer_complete: Allocating I/O context for local send operation");
 
+                // A zero-length datagram from the remote SOCKS5 relay must not be forwarded:
+                // allocate_io_context() only allocates a packet buffer when size != 0, so with
+                // io_size == 0 it returns a context whose wsa_buf is null and the send path
+                // below would dereference it (wsa_buf->len / memmove) and crash the process.
+                // remote_socket_ is connect()'d to the relay endpoint, so a malicious/malformed
+                // server (or a spoofed 0-byte datagram from that address) can reach this path.
+                // Skip the local send for empty datagrams and just re-arm the remote receive.
+                if (io_size > 0)
+                {
                 // Use shared_from_this() to get shared_ptr
                 if (auto* io_context_send_to_local = socks5_udp_per_io_context<T>::allocate_io_context(
                     proxy_io_operation::relay_io_write, this->shared_from_this(), true, io_size);
@@ -524,19 +642,21 @@ namespace proxy
                     NETLIB_DEBUG("process_receive_buffer_complete: {}:{} sending {} bytes to local socket",
                         remote_peer_address_, remote_peer_port_, io_size);
 
-                    if ((::WSASendTo(
+                    if (post_sendto(
                         local_socket_,
                         io_context_send_to_local->wsa_buf.get(),
-                        1,
-                        nullptr,
-                        0,
-                        reinterpret_cast<sockaddr*>(&local_address_sa_),
-                        (address_type_t::af_type == AF_INET) ? sizeof(sockaddr_in) : sizeof(sockaddr_in6),
                         io_context_send_to_local,
-                        nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
+                        reinterpret_cast<sockaddr*>(&local_address_sa_),
+                        (address_type_t::af_type == AF_INET) ? sizeof(sockaddr_in) : sizeof(sockaddr_in6)) == SOCKET_ERROR)
                     {
                         const auto error = WSAGetLastError();
                         NETLIB_WARNING("process_receive_buffer_complete: WSASendTo to local failed with error: {}", error);
+                        // A synchronously-failed post yields no IOCP completion, so
+                        // process_send_buffer_complete() will never run to release this heap
+                        // io_context. It holds a strong shared_from_this() reference, so leaving it
+                        // would pin this socket alive forever (defeating release_self_reference()).
+                        // Release it by hand, exactly as the completion path does.
+                        socks5_udp_per_io_context<T>::release_io_context(io_context_send_to_local);
                         // Close connection to remote peer in case of error
                         close_client();
                     }
@@ -549,16 +669,19 @@ namespace proxy
                 {
                     NETLIB_ERROR("process_receive_buffer_complete: Failed to allocate I/O context for local send");
                 }
+                } // if (io_size > 0): empty relay datagrams fall straight through to the re-arm
 
                 NETLIB_DEBUG("process_receive_buffer_complete: Initiating new receive operation on remote socket");
 
                 DWORD flags = 0;
 
+                io_posted();
                 auto ret = WSARecv(remote_socket_, &remote_recv_buf_, 1,
                     nullptr, &flags, &io_context_recv_from_remote_, nullptr);
 
                 if (const auto wsa_error = WSAGetLastError(); ret == SOCKET_ERROR && (ERROR_IO_PENDING != wsa_error))
                 {
+                    io_completed();
                     NETLIB_WARNING("process_receive_buffer_complete: WSARecv on remote socket failed with error: {}", wsa_error);
                     close_client();
                 }
@@ -697,21 +820,13 @@ namespace proxy
             NETLIB_DEBUG("inject_to_local: Packet buffer allocated successfully, copying {} bytes for {}:{}",
                 length, remote_peer_address_, remote_peer_port_);
 
-            context->wsa_buf->buf->len = length;
             memmove(context->wsa_buf->buf, data, length);
             context->wsa_buf->len = length;
 
             NETLIB_DEBUG("inject_to_local: Initiating WSASend to local socket {} with {} bytes for {}:{}",
                 static_cast<int>(local_socket_), length, remote_peer_address_, remote_peer_port_);
 
-            if ((::WSASend(
-                local_socket_,
-                &context->wsa_buf,
-                1,
-                nullptr,
-                0,
-                context,
-                nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
+            if (post_send(local_socket_, context->wsa_buf.get(), context) == SOCKET_ERROR)
             {
                 const auto error = WSAGetLastError();
                 NETLIB_WARNING("inject_to_local: WSASend failed with error: {} for {}:{}",
@@ -800,21 +915,13 @@ namespace proxy
             NETLIB_DEBUG("inject_to_remote: Packet buffer allocated successfully, copying {} bytes for {}:{}",
                 length, remote_peer_address_, remote_peer_port_);
 
-            context->wsa_buf->buf->len = length;
             memmove(context->wsa_buf->buf, data, length);
             context->wsa_buf->len = length;
 
             NETLIB_DEBUG("inject_to_remote: Initiating WSASend to remote socket {} with {} bytes for {}:{}",
                 static_cast<int>(remote_socket_), length, remote_peer_address_, remote_peer_port_);
 
-            if ((::WSASend(
-                remote_socket_,
-                &context->wsa_buf,
-                1,
-                nullptr,
-                0,
-                context,
-                nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
+            if (post_send(remote_socket_, context->wsa_buf.get(), context) == SOCKET_ERROR)
             {
                 const auto error = WSAGetLastError();
                 NETLIB_WARNING("inject_to_remote: WSASend failed with error: {} for {}:{}",
@@ -896,11 +1003,13 @@ namespace proxy
 
             DWORD flags = 0;
 
+            io_posted();
             auto ret = WSARecv(remote_socket_, &remote_recv_buf_, 1,
                 nullptr, &flags, &io_context_recv_from_remote_, nullptr);
 
             if (const auto wsa_error = WSAGetLastError(); ret == SOCKET_ERROR && (ERROR_IO_PENDING != wsa_error))
             {
+                io_completed();
                 NETLIB_WARNING("start_data_relay: WSARecv on remote socket failed with error: {} for {}:{}",
                     wsa_error, remote_peer_address_, remote_peer_port_);
 

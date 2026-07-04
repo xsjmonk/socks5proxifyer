@@ -1,5 +1,13 @@
 #pragma once
 
+// SIO_UDP_CONNRESET normally comes from <mstcpip.h>, but this header-only file relies on the
+// project's master include order and the macro is not reliably visible here across SDKs. Provide
+// the standard fallback definition; _WSAIOW/IOC_VENDOR are from <winsock2.h>, which is always
+// included ahead of this file.
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+
 namespace proxy
 {
     /**
@@ -272,8 +280,16 @@ namespace proxy
                     server_socket_,
                     [this](const DWORD num_bytes, OVERLAPPED* povlp, const BOOL status)
                     {
+                        // Count this completion for the entire duration of the callback so
+                        // stop() waits for it. EVERY completion the IOCP delivers on this
+                        // shared key -- the server read AND every per-session proxy
+                        // relay/negotiate/inject completion -- is balanced exactly once:
+                        // +1 here, -1 in the guard below. (Previously only the server-read
+                        // re-post incremented, so proxy completions drove the counter
+                        // negative and stop() could stop waiting while a callback still ran.)
+                        active_iocp_operations_.fetch_add(1, std::memory_order_acquire);
+
                         // RAII guard to ensure we decrement on all exit paths (including exceptions)
-                        // Note: Counter was already incremented BEFORE the I/O operation was posted
                         struct operation_guard {
                             std::atomic<int32_t>& counter;
                             
@@ -293,13 +309,19 @@ namespace proxy
                         auto result = true;
                         auto server_read = false;
 
-                        // Check if server is shutting down
-                        if (end_server_)
-                            return false;
-
-                        std::lock_guard lock(lock_);
+                        // unique_lock (not lock_guard): connect_to_remote_host() releases and
+                        // re-acquires this around its blocking SOCKS5 negotiation (see H2 there).
+                        std::unique_lock lock(lock_);
 
                         auto io_context = static_cast<per_io_context_t*>(povlp);
+
+                        // While the server is shutting down we must still fully process each
+                        // delivered completion -- decrement its outstanding-I/O count (via io_dec
+                        // below) and release any heap per-I/O context it owns -- but must start no
+                        // NEW work (no connect, no data-relay dispatch, no recv/send re-arm). Read
+                        // this once and gate the new-work paths on it. The unconditional io_dec
+                        // guard keeps outstanding_io_ balanced without a special early return.
+                        const bool shutting_down = end_server_.load(std::memory_order_acquire);
 
                         // If this is the server socket's read operation
                         if (io_context == &server_io_context_)
@@ -307,11 +329,11 @@ namespace proxy
                             // Server socket read operation complete
                             server_read = true;
 
-                            if (status && num_bytes)
+                            if (status && num_bytes && !shutting_down)
                             {
                                 do
                                 {
-                                    if (false == connect_to_remote_host(io_context))
+                                    if (false == connect_to_remote_host(io_context, lock))
                                     {
                                         result = false;
                                         break;
@@ -331,24 +353,62 @@ namespace proxy
                             }
                         }
 
-                        if (status && result)
+                        // Balance the io_posted() done when a per-session overlapped op was
+                        // posted. This completion is a real delivery -- success OR failure: an
+                        // aborted recv/send flushed by close_client()'s CancelIoEx during teardown
+                        // arrives here with status == false. It must therefore decrement the owning
+                        // proxy socket's outstanding-I/O count exactly once on every exit path,
+                        // independent of status/result and of whether we dispatch below; trapping
+                        // the decrement inside "if (status && result)" would leak the count on every
+                        // torn-down session and the socket would never become removable. Server-read
+                        // completions ride server_io_context_, which no proxy socket ever counted, so
+                        // they are excluded. The strong ref keeps the socket alive until decrement.
+                        std::shared_ptr<T> completing_socket = server_read ? nullptr : io_context->proxy_socket_ptr;
+                        struct io_dec_guard {
+                            T* s;
+                            explicit io_dec_guard(T* sock) : s(sock) {}
+                            ~io_dec_guard() { if (s) s->io_completed(); }
+                            io_dec_guard(const io_dec_guard&) = delete;
+                            io_dec_guard(io_dec_guard&&) = delete;
+                            io_dec_guard& operator=(const io_dec_guard&) = delete;
+                            io_dec_guard& operator=(io_dec_guard&&) = delete;
+                        } io_dec{ completing_socket.get() };
+
+                        // The proxy socket may have released its self-reference during teardown; a
+                        // late completion then finds null and is safely ignored.
+                        if (auto proxy_socket = io_context->proxy_socket_ptr)
                         {
                             switch (io_context->io_operation)
                             {
+                            // Reads (and the no-op negotiate handlers) run a handler that posts NEW
+                            // overlapped I/O, so only dispatch them on a successful, non-teardown
+                            // completion. On an aborted read (status == false) or during shutdown
+                            // there is nothing to free -- the recv uses a member io_context -- so we
+                            // just fall through to the io_dec decrement.
                             case proxy_io_operation::relay_io_read:
-                                io_context->proxy_socket_ptr->process_receive_buffer_complete(num_bytes, io_context);
-                                break;
-
-                            case proxy_io_operation::relay_io_write:
-                                io_context->proxy_socket_ptr->process_send_buffer_complete(num_bytes, io_context);
+                                if (status && result && !shutting_down)
+                                    proxy_socket->process_receive_buffer_complete(num_bytes, io_context);
                                 break;
 
                             case proxy_io_operation::negotiate_io_read:
-                                io_context->proxy_socket_ptr->process_receive_negotiate_complete(num_bytes, io_context);
+                                if (status && result && !shutting_down)
+                                    proxy_socket->process_receive_negotiate_complete(num_bytes, io_context);
                                 break;
 
                             case proxy_io_operation::negotiate_io_write:
-                                io_context->proxy_socket_ptr->process_send_negotiate_complete(num_bytes, io_context);
+                                if (status && result && !shutting_down)
+                                    proxy_socket->process_send_negotiate_complete(num_bytes, io_context);
+                                break;
+
+                            // Writes and injects own a HEAP io_context (allocated per datagram via
+                            // allocate_io_context / new). Their handler only releases that context
+                            // (and its pooled packet) and posts no new I/O, so it MUST run on EVERY
+                            // completion -- including an aborted one (status == false) flushed by
+                            // close_client()'s CancelIoEx during runtime teardown or shutdown.
+                            // Skipping it leaks the context and its buffer and keeps this socket
+                            // pinned alive via the context's strong proxy_socket_ptr.
+                            case proxy_io_operation::relay_io_write:
+                                proxy_socket->process_send_buffer_complete(num_bytes, io_context);
                                 break;
 
                             case proxy_io_operation::inject_io_write:
@@ -361,14 +421,18 @@ namespace proxy
 
                         if (server_read)
                         {
+                            // The server read context does not own a session; drop the strong
+                            // reference taken in connect_to_remote_host so a finished session
+                            // is not pinned alive until the next inbound datagram replaces it.
+                            io_context->proxy_socket_ptr.reset();
+
                             DWORD flags = 0;
 
-                            // Increment counter BEFORE posting the I/O operation
-                            // This ensures stop() will wait for this operation to complete
+                            // Re-arm the server read. The completion this generates will be
+                            // counted when it is dispatched (the fetch_add at the top of this
+                            // lambda), so there is no separate counter bump here.
                             if (!end_server_)
                             {
-                                active_iocp_operations_.fetch_add(1, std::memory_order_acquire);
-
                                 if ((::WSARecvFrom(
                                     server_socket_,
                                     &server_recv_buf_,
@@ -380,8 +444,6 @@ namespace proxy
                                     &server_io_context_,
                                     nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
                                 {
-                                    // Failed to post I/O, decrement counter
-                                    active_iocp_operations_.fetch_sub(1, std::memory_order_release);
                                     result = false;
                                 }
                             }
@@ -393,9 +455,8 @@ namespace proxy
                     completion_key_ = io_key;
                     DWORD flags = 0;
 
-                    // Increment counter BEFORE posting the initial I/O operation
-                    active_iocp_operations_.fetch_add(1, std::memory_order_acquire);
-
+                    // Post the initial server read. Its completion is counted when dispatched
+                    // (the fetch_add at the top of the completion lambda), so no bump here.
                     if ((::WSARecvFrom(
                         server_socket_,
                         &server_recv_buf_,
@@ -407,8 +468,6 @@ namespace proxy
                         &server_io_context_,
                         nullptr) == SOCKET_ERROR) && (ERROR_IO_PENDING != WSAGetLastError()))
                    {
-                        // Failed to post initial I/O, decrement counter
-                        active_iocp_operations_.fetch_sub(1, std::memory_order_release);
                         closesocket(server_socket_);
                         end_server_ = true;
                         return false;
@@ -436,12 +495,14 @@ namespace proxy
          *
          * This method performs a graceful shutdown by:
          * 1. Setting the end_server_ flag to signal shutdown
-         * 2. Closing the server socket, which causes pending I/O to complete with error
-         * 3. Waiting for all active IOCP operations to complete (tracked by atomic counter)
-         * 4. Joining background threads
-         * 5. Clearing resources
+         * 2. Closing the server socket, which causes the pending WSARecvFrom to complete with error
+         * 3. Cancelling each proxy socket's pending I/O (close_client) so its posted operations abort
+         * 4. Waiting for every proxy socket's overlapped I/O to drain (per-socket outstanding count)
+         *    and for all IOCP callbacks to finish
+         * 5. Releasing each socket's self-reference and clearing the map so the sockets destruct
+         * 6. Joining background threads
          *
-         * The IOCP thread pool itself is managed by io_completion_port and will be 
+         * The IOCP thread pool itself is managed by io_completion_port and will be
          * properly shut down when the completion port is destroyed.
          */
         void stop()
@@ -456,58 +517,134 @@ namespace proxy
             end_server_ = true;
 
             // Step 2: Close server socket
-            // This causes any pending WSARecvFrom to complete immediately with an error.
-            // When IOCP threads wake up, they'll see end_server_ == true and return false.
+            // This causes the pending WSARecvFrom to complete with an error. Note the completion
+            // lambda's bool return is ignored by io_completion_port; shutdown is enforced by the
+            // end_server_ gate (which suppresses new work inside the lambda) and by unregistering
+            // the handler after the drain below.
             if (server_socket_ != static_cast<SOCKET>(INVALID_SOCKET))
             {
                 closesocket(server_socket_);
                 server_socket_ = INVALID_SOCKET;
             }
 
-            // Step 2.5: Unregister the IOCP handler BEFORE waiting
-            if (completion_key_ != 0) {
-                (void)completion_port_.unregister_handler(completion_key_);
-                completion_key_ = 0;
-            }
+            // NOTE: the IOCP handler stays registered until AFTER the drain below. The aborted
+            // completions produced by close_client()'s CancelIoEx must still dispatch through it so
+            // they release their heap contexts and decrement each socket's outstanding_io_;
+            // unregistering here would drop those completions and the drain would never complete.
 
-            // Step 3: Close all proxy sockets FIRST to cancel their I/O operations
-            // This is CRITICAL: proxy sockets post their own I/O operations that will
-            // call back into this server's lambda, potentially after the server is destroyed.
-            // We must ensure all proxy socket I/O is cancelled before we proceed.
+            // Step 3: Cancel every proxy socket's pending I/O so its posted operations complete
+            // promptly (aborted) and stop pinning the socket. Keep the sockets in the map for now --
+            // they must stay alive until their in-flight completions have drained. Simply clearing
+            // the map does NOT destroy them: each socket's recv io_context holds a self-reference,
+            // so the destructor would never run and the handle/armed recv would leak.
             {
                 std::lock_guard lock(lock_);
                 if (!proxy_sockets_.empty())
                 {
-                    NETLIB_INFO("Closing {} proxy sockets before waiting for I/O completion", proxy_sockets_.size());
-                    // Closing the map entries will destroy the proxy sockets,
-                    // which will close their sockets and cancel any pending I/O
-                    proxy_sockets_.clear();
+                    NETLIB_INFO("Cancelling I/O on {} proxy sockets before draining", proxy_sockets_.size());
+                    for (auto& entry : proxy_sockets_)
+                    {
+                        if (entry.second)
+                            entry.second->close_client(); // idempotent: CancelIoEx + closesocket
+                    }
                 }
             }
 
-            // Step 4: Wait for all active IOCP operations to complete
-            // The socket closure ensures pending operations complete quickly.
-            // The atomic counter ensures we wait until all in-flight operations finish.
-            // Use exponential backoff to avoid busy-waiting
+            // Step 4: Wait until every proxy socket has drained all posted overlapped I/O (its
+            // per-socket outstanding count reaches zero) AND no IOCP callback is still running.
+            // The handler is still registered, so close_client()'s aborted completions dispatch,
+            // release their heap contexts, and the io_dec guard decrements the count. Gate on the
+            // per-socket count -- not just active_iocp_operations_ -- because a cancelled completion
+            // may still be queued (not yet dispatched) while active_iocp_operations_ momentarily
+            // reads zero; releasing a socket's self-reference before that completion is processed
+            // would free the io_context out from under it. Re-issue close_client() on any not-yet-
+            // drained socket each pass so a session armed concurrently with shutdown (e.g. a
+            // blocking connect that finished after end_server_ was set) is cancelled too.
+            // Exponential backoff to avoid busy-waiting.
             using namespace std::chrono_literals;
             int wait_iterations = 0;
+            bool drained_ok = false;
 
-            while (active_iocp_operations_.load(std::memory_order_acquire) > 0)
+            while (true)
             {
-                if (constexpr int max_wait_iterations = 100; ++wait_iterations > max_wait_iterations)
+                bool drained = true;
                 {
-                    // Log warning if we're taking too long
-                    NETLIB_WARNING("Timeout waiting for IOCP operations to complete. Active operations: {}",
-                    active_iocp_operations_.load(std::memory_order_relaxed));
+                    std::lock_guard lock(lock_);
+                    for (auto& entry : proxy_sockets_)
+                    {
+                        if (entry.second && entry.second->outstanding_io() != 0)
+                        {
+                            drained = false;
+                            entry.second->close_client(); // idempotent; cancels late-armed sessions
+                        }
+                    }
+                }
+
+                if (drained && active_iocp_operations_.load(std::memory_order_acquire) == 0)
+                {
+                    drained_ok = true;
                     break;
                 }
-             
+
+                if (constexpr int max_wait_iterations = 100; ++wait_iterations > max_wait_iterations)
+                {
+                    NETLIB_ERROR("Timeout waiting for proxy socket I/O to drain (active operations: {}); "
+                        "leaving sessions pinned to avoid freeing in-flight io_contexts",
+                        active_iocp_operations_.load(std::memory_order_relaxed));
+                    break;
+                }
+
                 // Exponential backoff: 1ms, 2ms, 4ms, 8ms, ... up to 100ms
                 const auto wait_time = std::min(1ms * (1 << std::min(wait_iterations / 10, 6)), 100ms);
                 std::this_thread::sleep_for(wait_time);
             }
 
-            // Step 5: Join background threads
+            // Step 4b: Regardless of how the drain loop exited, make sure no IOCP callback is still
+            // executing before we proceed. A worker inside the completion lambda has captured `this`
+            // (it touches lock_, end_server_, packet_pool_, server_io_context_ and decrements
+            // active_iocp_operations_ on the way out), so unregistering the handler and returning
+            // from stop() while active_iocp_operations_ > 0 risks a use-after-free of the server if
+            // the object is then destroyed. On the happy path this is already zero (it is part of
+            // the break condition above); on the timeout path we still wait here. Lambdas are
+            // bounded work, so this reliably reaches zero; bound it as a last resort.
+            for (int active_wait = 0;
+                 active_iocp_operations_.load(std::memory_order_acquire) != 0;
+                 ++active_wait)
+            {
+                if (active_wait > 200)
+                {
+                    NETLIB_ERROR("IOCP callbacks still active ({}) after drain; proceeding may be unsafe",
+                        active_iocp_operations_.load(std::memory_order_relaxed));
+                    break;
+                }
+                std::this_thread::sleep_for(std::min(1ms * (1 << std::min(active_wait / 10, 6)), 100ms));
+            }
+
+            // Step 5: All completions have now been processed (or we timed out), so unregister the
+            // IOCP handler -- no further completion will dispatch into this server.
+            if (completion_key_ != 0)
+            {
+                (void)completion_port_.unregister_handler(completion_key_);
+                completion_key_ = 0;
+            }
+
+            // Step 6: Only if the drain completed do we break each socket's self-reference and clear
+            // the map so the sockets (and their already-released heap I/O contexts) destruct. If the
+            // drain timed out, some overlapped op is still outstanding; releasing/clearing now would
+            // free an io_context that a still-queued completion could dereference, so we deliberately
+            // leak those sessions instead (a bounded, shutdown-only leak) rather than risk a UAF.
+            if (drained_ok)
+            {
+                std::lock_guard lock(lock_);
+                for (auto& entry : proxy_sockets_)
+                {
+                    if (entry.second)
+                        entry.second->release_self_reference();
+                }
+                proxy_sockets_.clear();
+            }
+
+            // Step 7: Join background threads
             if (proxy_server_.joinable())
             {
                 proxy_server_.join();
@@ -560,6 +697,21 @@ namespace proxy
             if (server_socket_ == static_cast<SOCKET>(INVALID_SOCKET))
             {
                 return false;
+            }
+
+            // Disable SIO_UDP_CONNRESET. Without this, a prior datagram that elicited an ICMP
+            // port-unreachable from a since-closed local peer makes the NEXT WSARecvFrom complete
+            // with WSAECONNRESET, which would tear down the server read loop and stop proxying all
+            // UDP. UDP is connectionless, so this "connection reset" is spurious -- suppress it.
+            {
+                BOOL new_behavior = FALSE;
+                DWORD bytes_returned = 0;
+                if (WSAIoctl(server_socket_, SIO_UDP_CONNRESET, &new_behavior, sizeof(new_behavior),
+                    nullptr, 0, &bytes_returned, nullptr, nullptr) == SOCKET_ERROR)
+                {
+                    NETLIB_WARNING("create_server_socket: failed to disable SIO_UDP_CONNRESET: {}",
+                        WSAGetLastError());
+                }
             }
 
             if constexpr (address_type_t::af_type == AF_INET)
@@ -680,6 +832,16 @@ namespace proxy
             }
             else
             {
+                // Allow this AF_INET6 upstream control socket to reach IPv4 SOCKS5
+                // servers via IPv4-mapped addresses (e.g. ::ffff:127.0.0.1) by
+                // clearing IPV6_V6ONLY so the dual-stack socket accepts both families.
+                DWORD v6_only = 0;
+                if (setsockopt(socks_tcp_socket, IPPROTO_IPV6, IPV6_V6ONLY,
+                    reinterpret_cast<const char*>(&v6_only), sizeof(v6_only)) == SOCKET_ERROR)
+                {
+                    NETLIB_WARNING("Failed to clear IPV6_V6ONLY on SOCKS5 control socket: {}", WSAGetLastError());
+                }
+
                 sockaddr_in6 sa_local{};
                 sa_local.sin6_family = address_type_t::af_type;
                 sa_local.sin6_port = htons(0);
@@ -701,8 +863,8 @@ namespace proxy
                 sa_service.sin_addr = socks_server_address;
                 sa_service.sin_port = htons(socks_server_port);
 
-                if (connect(socks_tcp_socket, reinterpret_cast<SOCKADDR*>(&sa_service), sizeof(sa_service)) ==
-                    SOCKET_ERROR)
+                if (!connect_with_timeout(socks_tcp_socket, reinterpret_cast<SOCKADDR*>(&sa_service),
+                    sizeof(sa_service), 5000))
                 {
                     closesocket(socks_tcp_socket);
                     return INVALID_SOCKET;
@@ -715,8 +877,8 @@ namespace proxy
                 sa_service.sin6_addr = socks_server_address;
                 sa_service.sin6_port = htons(socks_server_port);
 
-                if (connect(socks_tcp_socket, reinterpret_cast<SOCKADDR*>(&sa_service), sizeof(sa_service)) ==
-                    SOCKET_ERROR)
+                if (!connect_with_timeout(socks_tcp_socket, reinterpret_cast<SOCKADDR*>(&sa_service),
+                    sizeof(sa_service), 5000))
                 {
                     closesocket(socks_tcp_socket);
                     return INVALID_SOCKET;
@@ -727,18 +889,79 @@ namespace proxy
         }
 
         /**
+         * @brief Connects a socket with a bounded timeout.
+         *
+         * A plain blocking connect() is not bounded by SO_*TIMEO and can hang for the OS
+         * default TCP connect timeout (~21s) on a black-holed SOCKS5 server while this thread
+         * holds the server lock, stalling all UDP relay. This switches the socket to
+         * non-blocking, issues the connect, and waits with select() up to timeout_ms, then
+         * restores blocking mode for the subsequent SO_*TIMEO-bounded send/recv.
+         *
+         * @return true if the connection completed within the timeout, false otherwise.
+         */
+        static bool connect_with_timeout(const SOCKET s, const sockaddr* const addr, const int addr_len,
+                                         const DWORD timeout_ms) noexcept
+        {
+            u_long non_blocking = 1;
+            if (ioctlsocket(s, FIONBIO, &non_blocking) == SOCKET_ERROR)
+                return false;
+
+            auto succeeded = false;
+            if (connect(s, addr, addr_len) == 0)
+            {
+                succeeded = true;
+            }
+            else if (WSAGetLastError() == WSAEWOULDBLOCK)
+            {
+                fd_set write_set;
+                FD_ZERO(&write_set);
+                FD_SET(s, &write_set);
+                fd_set error_set;
+                FD_ZERO(&error_set);
+                FD_SET(s, &error_set);
+
+                timeval tv{};
+                tv.tv_sec = static_cast<long>(timeout_ms / 1000);
+                tv.tv_usec = static_cast<long>((timeout_ms % 1000) * 1000);
+
+                if (const auto sel = select(0, nullptr, &write_set, &error_set, &tv);
+                    sel > 0 && FD_ISSET(s, &write_set))
+                {
+                    auto so_error = 0;
+                    auto len = static_cast<int>(sizeof(so_error));
+                    if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_error), &len) == 0 &&
+                        so_error == 0)
+                    {
+                        succeeded = true;
+                    }
+                }
+            }
+
+            // Restore blocking mode for the subsequent SO_*TIMEO-bounded send/recv. If the
+            // socket connected but cannot be put back into blocking mode, fail the connect so
+            // the caller closes it rather than issuing blocking send/recv on a still-non-blocking
+            // socket (which would spuriously return WSAEWOULDBLOCK and break negotiation).
+            u_long blocking = 0;
+            if (ioctlsocket(s, FIONBIO, &blocking) == SOCKET_ERROR)
+                return false;
+            return succeeded;
+        }
+
+        /**
          * @brief Performs SOCKS5 negotiation and sends the UDP ASSOCIATE command.
          *
          * This method negotiates authentication with the SOCKS5 proxy server over the provided TCP socket,
          * using either "NO AUTHENTICATION REQUIRED" or "USERNAME/PASSWORD" (RFC 1929) as needed.
          * If authentication succeeds, it sends a UDP ASSOCIATE command to the proxy and retrieves the
-         * UDP port assigned by the proxy for relaying UDP packets.
+         * UDP relay endpoint assigned by the proxy for relaying UDP packets.
          *
          * @param socks_tcp_socket The connected TCP socket to the SOCKS5 proxy server.
          * @param negotiate_ctx Unique pointer to the negotiation context, containing optional credentials.
-         * @return The UDP port assigned by the SOCKS5 proxy for UDP relay, or std::nullopt on failure.
+         * @return The UDP relay endpoint assigned by the SOCKS5 proxy, or std::nullopt on failure.
          */
-        [[nodiscard]] std::optional<uint16_t> associate_to_socks5_proxy(const SOCKET socks_tcp_socket,
+        [[nodiscard]] std::optional<net::ip_endpoint<address_type_t>> associate_to_socks5_proxy(
+            const SOCKET socks_tcp_socket,
+            const address_type_t socks_server_address,
             std::unique_ptr<negotiate_context_t>&
             negotiate_ctx) const noexcept
         {
@@ -746,8 +969,6 @@ namespace proxy
 
             socks5_ident_req<2> ident_req{};
             socks5_ident_resp ident_resp{};
-            socks5_req<address_type_t> associate_req;
-            socks5_resp<address_type_t> associate_resp;
 
             auto socks5_ident_req_size = sizeof(ident_req);
 
@@ -856,20 +1077,37 @@ namespace proxy
                     "[SOCKS5]: associate_to_socks5_proxy: USERNAME/PASSWORD authentication SUCCESS");
             }
 
-            associate_req.version = 5;
-            associate_req.cmd = 3;
-            associate_req.reserved = 0;
+            // Build the UDP ASSOCIATE request. DST.ADDR/DST.PORT only advertise the
+            // address the client expects to send datagrams from; we advertise the
+            // unspecified address. The ATYP must match the family actually used on the
+            // wire: the IPv6 proxy instance reaches the (IPv4) SOCKS5 server through an
+            // IPv4-mapped upstream, so an IPv4-only server would reject an ATYP=4 request.
+            // Send ATYP=1 with a zero IPv4 address whenever the upstream is IPv4 or
+            // IPv4-mapped, and ATYP=4 only for a genuine IPv6 upstream.
+            unsigned char associate_req_buf[4 + sizeof(in6_addr) + sizeof(unsigned short)]{};
+            associate_req_buf[0] = 5; // VER
+            associate_req_buf[1] = 3; // CMD = UDP ASSOCIATE
+            associate_req_buf[2] = 0; // RSV
+            int associate_req_len;
             if constexpr (address_type_t::af_type == AF_INET)
             {
-                associate_req.address_type = 1;
+                associate_req_buf[3] = 1; // ATYP = IPv4
+                associate_req_len = 4 + 4 + static_cast<int>(sizeof(unsigned short));
             }
             else
             {
-                associate_req.address_type = 4;
+                if (IN6_IS_ADDR_V4MAPPED(static_cast<const in6_addr*>(&socks_server_address)))
+                {
+                    associate_req_buf[3] = 1; // ATYP = IPv4 (IPv4-mapped upstream)
+                    associate_req_len = 4 + 4 + static_cast<int>(sizeof(unsigned short));
+                }
+                else
+                {
+                    associate_req_buf[3] = 4; // ATYP = IPv6 (genuine IPv6 upstream)
+                    associate_req_len = 4 + static_cast<int>(sizeof(in6_addr)) + static_cast<int>(sizeof(unsigned short));
+                }
             }
-            associate_req.dest_address = address_type_t{};
-            associate_req.dest_port = 0;
-            result = send(socks_tcp_socket, reinterpret_cast<const char*>(&associate_req), sizeof(associate_req), 0);
+            result = send(socks_tcp_socket, reinterpret_cast<const char*>(associate_req_buf), associate_req_len, 0);
             if (result == SOCKET_ERROR)
             {
                 NETLIB_INFO(
@@ -878,28 +1116,166 @@ namespace proxy
                 return {};
             }
 
-            result = recv(socks_tcp_socket, reinterpret_cast<char*>(&associate_resp), sizeof(associate_resp), 0);
-            if (result == SOCKET_ERROR)
+            // Read and validate the SOCKS5 UDP ASSOCIATE reply. The reply's BND.ADDR
+            // family (ATYP) is selected by the SERVER and is independent of the address
+            // family this proxy instance uses: an IPv6 proxy instance reaches the
+            // configured (IPv4) SOCKS5 server through an IPv4-mapped upstream, so the
+            // server typically replies with ATYP=1 and a 4-byte BND.ADDR. Parsing the
+            // reply as a fixed-size socks5_resp<address_type_t> (which has a 16-byte
+            // BND.ADDR for IPv6) would then read BND.PORT from the wrong offset and
+            // hand back a bogus relay port. Parse the 4-byte reply prefix, then read
+            // exactly the bytes implied by the returned ATYP and take BND.PORT from the
+            // correct position so the relay port is family-agnostic and correct.
+
+            // Blocking read of exactly 'len' bytes (recv() may return short reads on a
+            // stream socket); returns false on error or premature close.
+            const auto recv_exact = [](const SOCKET s, void* const buffer, const int len) -> bool
+            {
+                // Bound the TOTAL time spent assembling these bytes, not just each recv().
+                // SO_RCVTIMEO is a per-call timeout, so a server that drips one byte just
+                // under it could otherwise keep this loop (and the IOCP worker that holds
+                // the server lock) alive for timeout * byte-count. Hold a single absolute
+                // deadline, shrink the receive timeout toward it on every iteration, and
+                // restore the socket's default timeout before returning.
+                constexpr DWORD total_timeout_ms = 5000;
+
+                // Save the socket's configured receive timeout and restore exactly that on
+                // every exit path, since the loop below temporarily shrinks SO_RCVTIMEO
+                // toward the deadline (leaving a tiny/stale value on the shared control
+                // socket would otherwise affect any later read on it).
+                DWORD original_timeout = total_timeout_ms;
+                int original_timeout_size = static_cast<int>(sizeof(original_timeout));
+                getsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+                    reinterpret_cast<char*>(&original_timeout), &original_timeout_size);
+
+                const auto restore_timeout = [s, original_timeout]
+                {
+                    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+                        reinterpret_cast<const char*>(&original_timeout), sizeof(original_timeout));
+                };
+
+                auto* const bytes = static_cast<char*>(buffer);
+                const auto deadline = GetTickCount64() + total_timeout_ms;
+                int received = 0;
+                while (received < len)
+                {
+                    const auto now = GetTickCount64();
+                    if (now >= deadline)
+                    {
+                        restore_timeout();
+                        return false;
+                    }
+
+                    auto remaining_ms = static_cast<DWORD>(deadline - now);
+                    if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+                        reinterpret_cast<const char*>(&remaining_ms), sizeof(remaining_ms)) == SOCKET_ERROR)
+                    {
+                        restore_timeout();
+                        return false;
+                    }
+
+                    const auto n = recv(s, bytes + received, len - received, 0);
+                    if (n == SOCKET_ERROR || n == 0)
+                    {
+                        restore_timeout();
+                        return false;
+                    }
+                    received += n;
+                }
+
+                restore_timeout();
+                return true;
+            };
+
+            // Fixed 4-byte reply prefix: VER, REP, RSV, ATYP.
+            struct socks5_resp_prefix
+            {
+                unsigned char version;
+                unsigned char reply;
+                unsigned char reserved;
+                unsigned char address_type;
+            } resp_prefix{};
+
+            if (!recv_exact(socks_tcp_socket, &resp_prefix, sizeof(resp_prefix)))
             {
                 NETLIB_INFO(
-                    "[SOCKS5]: associate_to_socks5_proxy: Failed to receive SOCKS5 ASSOCIATE response: {}",
-                    WSAGetLastError());
+                    "[SOCKS5]: associate_to_socks5_proxy: Failed to receive SOCKS5 ASSOCIATE reply header");
                 return {};
             }
 
-            if ((associate_resp.version != 5) ||
-                (associate_resp.reply != 0))
+            if ((resp_prefix.version != 5) ||
+                (resp_prefix.reply != 0))
             {
                 NETLIB_INFO(
                     "[SOCKS5]: associate_to_socks5_proxy: SOCKS5 ASSOCIATE has failed");
                 return {};
             }
 
-            NETLIB_INFO(
-                "[SOCKS5]: associate_to_socks5_proxy: SOCKS5 ASSOCIATE SUCCESS port: {}",
-                ntohs(associate_resp.bind_port));
+            // Determine BND.ADDR length from the server-selected ATYP. For ATYP=3
+            // (domain) the first byte carries the name length.
+            int bnd_addr_len;
+            switch (resp_prefix.address_type)
+            {
+            case 1: // IPv4
+                bnd_addr_len = 4;
+                break;
+            case 4: // IPv6
+                bnd_addr_len = 16;
+                break;
+            case 3: // domain name
+                {
+                    unsigned char domain_len = 0;
+                    if (!recv_exact(socks_tcp_socket, &domain_len, sizeof(domain_len)))
+                    {
+                        NETLIB_INFO(
+                            "[SOCKS5]: associate_to_socks5_proxy: Failed to receive BND.ADDR domain length");
+                        return {};
+                    }
+                    bnd_addr_len = domain_len;
+                }
+                break;
+            default:
+                NETLIB_INFO(
+                    "[SOCKS5]: associate_to_socks5_proxy: Unexpected BND.ADDR type {} in ASSOCIATE reply",
+                    resp_prefix.address_type);
+                return {};
+            }
 
-            return ntohs(associate_resp.bind_port);
+            // Read BND.ADDR followed by the 2-byte BND.PORT. The buffer is sized for the
+            // largest possible BND.ADDR (a 255-byte domain) plus the port.
+            unsigned char bnd_addr_and_port[255 + sizeof(unsigned short)]{};
+            if (!recv_exact(socks_tcp_socket, bnd_addr_and_port,
+                bnd_addr_len + static_cast<int>(sizeof(unsigned short))))
+            {
+                NETLIB_INFO(
+                    "[SOCKS5]: associate_to_socks5_proxy: Failed to receive BND.ADDR/BND.PORT");
+                return {};
+            }
+
+            // BND.PORT immediately follows BND.ADDR, in network byte order. Assembling
+            // the two big-endian bytes directly yields the host-order port value.
+            const auto bind_port = static_cast<uint16_t>(
+                (static_cast<uint16_t>(bnd_addr_and_port[bnd_addr_len]) << 8) |
+                static_cast<uint16_t>(bnd_addr_and_port[bnd_addr_len + 1]));
+
+            // The UDP relay endpoint is, in every deployment ProxiFyre supports, the same
+            // host as the SOCKS5 server we connected the control socket to. Servers
+            // frequently report a BND.ADDR that is only meaningful from their own vantage
+            // point (0.0.0.0, 127.0.0.1, or an internal/NAT address), so honoring it
+            // verbatim can aim the relay at an address the client cannot reach -- and it
+            // would also turn a server-supplied address into a connect() target. We
+            // therefore relay to the address we already reached over the control
+            // connection (socks_server_address -- the IPv4-mapped upstream for the IPv6
+            // instance) and take only BND.PORT from the reply. BND.PORT was parsed at the
+            // family-correct offset above, so the relay port is correct regardless of the
+            // ATYP the server selected, and no blocking DNS lookup is needed for an
+            // ATYP=3 (domain) reply.
+            NETLIB_INFO(
+                "[SOCKS5]: associate_to_socks5_proxy: SOCKS5 ASSOCIATE SUCCESS endpoint: {}:{}",
+                socks_server_address,
+                bind_port);
+
+            return net::ip_endpoint<address_type_t>{ socks_server_address, bind_port };
         }
 
         /**
@@ -921,7 +1297,7 @@ namespace proxy
          *                   On success, its proxy_socket_ptr is set to the active proxy socket.
          * @return True if the relay session was established or already exists, false on failure.
          */
-        bool connect_to_remote_host(per_io_context_t* io_context)
+        bool connect_to_remote_host(per_io_context_t* io_context, std::unique_lock<std::mutex>& lock)
         {
             uint16_t local_peer_port = 0;
             address_type_t local_peer_address{};
@@ -957,6 +1333,18 @@ namespace proxy
                 remote_address,
                 remote_port);
 
+            // H2: the SOCKS5 TCP connect + ASSOCIATE below is fully blocking (connect_with_timeout
+            // up to ~5s, then several blocking send/recv each bounded only by a ~5s timeout), so it
+            // can hold lock_ for 10s+. Under lock_ that freezes EVERY other UDP completion for this
+            // proxy plus clear_thread and stop(). Release lock_ across the blocking negotiation and
+            // relay-socket setup. This is safe: the server read is serialized (recv_from_sa_ and
+            // server_receive_buffer_ are not re-armed until after this returns), the new session is
+            // not yet in proxy_sockets_ so no other completion can touch it, and our completion's
+            // active_iocp_operations_ guard is still held so stop() cannot tear the server down
+            // underneath us. We re-acquire lock_ and re-check end_server_ before publishing. Every
+            // early return below re-acquires lock_ first: the caller relies on it being held.
+            lock.unlock();
+
             auto socks5_tcp_socket = connect_to_socks5_proxy(remote_address, remote_port);
             if (socks5_tcp_socket == INVALID_SOCKET)
             {
@@ -964,11 +1352,12 @@ namespace proxy
                     "connect_to_remote_host: Failed to connect to SOCKS5 proxy: {}:{}",
                     remote_address,
                     remote_port);
+                lock.lock();
                 return false;
             }
 
-            auto udp_port = associate_to_socks5_proxy(socks5_tcp_socket, negotiate_ctx);
-            if (!udp_port.has_value())
+            auto udp_endpoint = associate_to_socks5_proxy(socks5_tcp_socket, remote_address, negotiate_ctx);
+            if (!udp_endpoint.has_value())
             {
                 NETLIB_DEBUG(
                     "connect_to_remote_host: ASSOCIATE command has failed: {}:{}",
@@ -976,13 +1365,14 @@ namespace proxy
                     remote_port);
 
                 closesocket(socks5_tcp_socket);
+                lock.lock();
                 return false;
             }
 
             NETLIB_DEBUG(
                 "connect_to_remote_host: UDP connect: {}:{}",
-                remote_address,
-                udp_port.value());
+                udp_endpoint->ip,
+                udp_endpoint->port);
 
             auto remote_socket = WSASocket(address_type_t::af_type, SOCK_DGRAM, IPPROTO_UDP, nullptr, 0,
                 WSA_FLAG_OVERLAPPED);
@@ -992,7 +1382,22 @@ namespace proxy
                 NETLIB_DEBUG(
                     "connect_to_remote_host: Failed to create UDP socket: {}",
                     WSAGetLastError());
+                closesocket(socks5_tcp_socket);
+                lock.lock();
                 return false;
+            }
+
+            // Suppress spurious WSAECONNRESET on the relay socket too (see create_server_socket):
+            // an ICMP port-unreachable from the SOCKS5 UDP relay must not kill this relay's reads.
+            {
+                BOOL new_behavior = FALSE;
+                DWORD bytes_returned = 0;
+                if (WSAIoctl(remote_socket, SIO_UDP_CONNRESET, &new_behavior, sizeof(new_behavior),
+                    nullptr, 0, &bytes_returned, nullptr, nullptr) == SOCKET_ERROR)
+                {
+                    NETLIB_WARNING("connect_to_remote_host: failed to disable SIO_UDP_CONNRESET on relay socket: {}",
+                        WSAGetLastError());
+                }
             }
 
             if constexpr (address_type_t::af_type == AF_INET)
@@ -1010,11 +1415,23 @@ namespace proxy
                     NETLIB_DEBUG(
                         "connect_to_remote_host: Failed to bind UDP socket: {}",
                         WSAGetLastError());
+                    lock.lock();
                     return false;
                 }
             }
             else
             {
+                // Dual-stack the AF_INET6 UDP relay socket so it can reach an IPv4
+                // SOCKS5 server's UDP relay endpoint via its IPv4-mapped address
+                // (the relay address mirrors the configured control address).
+                DWORD v6_only = 0;
+                if (setsockopt(remote_socket, IPPROTO_IPV6, IPV6_V6ONLY,
+                    reinterpret_cast<const char*>(&v6_only), sizeof(v6_only)) == SOCKET_ERROR)
+                {
+                    NETLIB_WARNING("connect_to_remote_host: Failed to clear IPV6_V6ONLY on UDP relay socket: {}",
+                        WSAGetLastError());
+                }
+
                 sockaddr_in6 sa_local{};
                 sa_local.sin6_family = address_type_t::af_type;
                 sa_local.sin6_port = htons(0);
@@ -1028,6 +1445,7 @@ namespace proxy
                     NETLIB_DEBUG(
                         "connect_to_remote_host: Failed to bind UDP socket: {}",
                         WSAGetLastError());
+                    lock.lock();
                     return false;
                 }
             }
@@ -1037,8 +1455,8 @@ namespace proxy
             {
                 sockaddr_in sa_service{};
                 sa_service.sin_family = address_type_t::af_type;
-                sa_service.sin_addr = remote_address;
-                sa_service.sin_port = htons(udp_port.value());
+                sa_service.sin_addr = udp_endpoint->ip;
+                sa_service.sin_port = htons(udp_endpoint->port);
 
                 if (connect(remote_socket, reinterpret_cast<SOCKADDR*>(&sa_service), sizeof(sa_service)) ==
                     SOCKET_ERROR)
@@ -1048,6 +1466,7 @@ namespace proxy
                     NETLIB_DEBUG(
                         "connect_to_remote_host: Failed to connect UDP socket: {}",
                         WSAGetLastError());
+                    lock.lock();
                     return false;
                 }
             }
@@ -1055,8 +1474,8 @@ namespace proxy
             {
                 sockaddr_in6 sa_service{};
                 sa_service.sin6_family = address_type_t::af_type;
-                sa_service.sin6_addr = remote_address;
-                sa_service.sin6_port = htons(udp_port.value());
+                sa_service.sin6_addr = udp_endpoint->ip;
+                sa_service.sin6_port = htons(udp_endpoint->port);
 
                 if (connect(remote_socket, reinterpret_cast<SOCKADDR*>(&sa_service), sizeof(sa_service)) ==
                     SOCKET_ERROR)
@@ -1066,15 +1485,41 @@ namespace proxy
                     NETLIB_DEBUG(
                         "connect_to_remote_host: Failed to connect UDP socket: {}",
                         WSAGetLastError());
+                    lock.lock();
                     return false;
                 }
+            }
+
+            // Re-acquire lock_ to publish the session (see the lock.unlock() above). From here on
+            // proxy_sockets_ and the server members are accessed under the lock again.
+            lock.lock();
+
+            // stop() may have set end_server_ during the unlocked window. It is currently blocked in
+            // its drain loop waiting on our active_iocp_operations_ guard, so the server object is
+            // still alive -- but we must not create a NEW session during shutdown (it would only be
+            // torn down again). Abort cleanly.
+            if (end_server_.load(std::memory_order_acquire))
+            {
+                closesocket(remote_socket);
+                closesocket(socks5_tcp_socket);
+                return false;
+            }
+
+            // Server reads are serialized so no concurrent creation for this source port is expected,
+            // but guard defensively: if an entry appeared meanwhile, drop what we built and use it.
+            if (auto existing = proxy_sockets_.find(local_peer_port); existing != proxy_sockets_.end())
+            {
+                closesocket(remote_socket);
+                closesocket(socks5_tcp_socket);
+                io_context->proxy_socket_ptr = existing->second;
+                return true;
             }
 
             auto [it, result] = proxy_sockets_.emplace(local_peer_port,
                 std::make_shared<T>(
                     socks5_tcp_socket, packet_pool_, server_socket_,
-                    recv_from_sa_, remote_socket, remote_address,
-                    udp_port.value(), std::move(negotiate_ctx),
+                    recv_from_sa_, remote_socket, udp_endpoint->ip,
+                    udp_endpoint->port, std::move(negotiate_ctx),
                     logger::log_level_, logger::log_stream_));
 
             if (result)
@@ -1095,22 +1540,23 @@ namespace proxy
                 {
                     NETLIB_DEBUG(
                         "connect_to_remote_host: Failed to initialize proxy socket for: {}:{} ({})",
-                        remote_address,
-                        udp_port.value(),
+                        udp_endpoint->ip,
+                        udp_endpoint->port,
                         e.what());
-                    // Remove from map - the shared_ptr destructor will close the sockets
-                    // that were transferred to T's constructor
-                    proxy_sockets_.erase(it);
+                    // initialize_io_contexts() may already have installed the recv self-
+                    // reference; erasing the map entry alone would not run the destructor.
+                    // Cancel I/O, break the self-reference (only once I/O has drained), and
+                    // remove the entry. See cleanup_failed_proxy_socket().
+                    cleanup_failed_proxy_socket(it);
                     return false;
                 }
                 catch (...)
                 {
                     NETLIB_DEBUG(
                         "connect_to_remote_host: Failed to initialize proxy socket for: {}:{} (unknown exception)",
-                        remote_address,
-                        udp_port.value());
-                    // Remove from map - the shared_ptr destructor will close the sockets
-                    proxy_sockets_.erase(it);
+                        udp_endpoint->ip,
+                        udp_endpoint->port);
+                    cleanup_failed_proxy_socket(it);
                     return false;
                 }
             }
@@ -1120,12 +1566,60 @@ namespace proxy
                 closesocket(socks5_tcp_socket);
                 NETLIB_DEBUG(
                     "connect_to_remote_host: Failed to create proxy socket for: {}:{}",
-                    remote_address,
-                    udp_port.value());
+                    udp_endpoint->ip,
+                    udp_endpoint->port);
                 return false;
             }
 
             return result;
+        }
+
+        /**
+         * @brief Rolls back a partially-constructed proxy socket on the setup-exception path.
+         *
+         * When connect_to_remote_host() throws after inserting the socket into proxy_sockets_,
+         * initialize_io_contexts() may already have installed the recv io_context's self-
+         * reference (a strong shared_ptr back to the socket -- see
+         * socks5_udp_proxy_socket::initialize_io_contexts()). Erasing the map entry drops only
+         * the map's strong reference; the self-reference would keep the object alive with its
+         * destructor -- and thus its CancelIoEx + closesocket -- never running, leaking the
+         * remote/SOCKS socket handles and any armed WSARecv.
+         *
+         * Cancel I/O and close the sockets first (close_client(), idempotent). Then break the
+         * self-reference and remove the entry immediately ONLY if no overlapped I/O could still
+         * be in flight (outstanding_io() == 0) -- e.g. an exception before start_data_relay()
+         * posted its recv. If start_data_relay() had already posted a WSARecv, close_client()'s
+         * CancelIoEx queues its aborted completion but does not deliver it synchronously, so
+         * outstanding_io() is still nonzero here: leave the socket in the map and let
+         * is_ready_for_removal() drain it and release the self-reference once the count reaches
+         * 0. Releasing the self-reference inline while that completion is outstanding would risk
+         * a use-after-free when the IOCP handler finally dereferences its proxy_socket_ptr. This
+         * mirrors the drain gate in socks5_udp_proxy_socket::is_ready_for_removal(). Runs under
+         * the caller's lock_ (connect_to_remote_host is called while the completion handler
+         * holds it), which serializes this against completions and clear_thread.
+         *
+         * @param it Valid iterator into proxy_sockets_ for the failed session.
+         */
+        void cleanup_failed_proxy_socket(const typename decltype(proxy_sockets_)::iterator it)
+        {
+            if (it->second)
+            {
+                // Idempotent: cancels any armed WSARecv and closes remote_socket_/socks_socket_.
+                it->second->close_client();
+
+                // A still-pending recv's aborted completion has not been delivered yet, so its
+                // outstanding_io() count is nonzero. Keep the socket in the map so the normal
+                // drain path (is_ready_for_removal()) releases the self-reference after the
+                // completion arrives; releasing it here would be a use-after-free.
+                if (it->second->outstanding_io() != 0)
+                    return;
+
+                // No overlapped I/O in flight: safe to break the self-reference cycle so the
+                // destructor can run once the map entry is erased below.
+                it->second->release_self_reference();
+            }
+
+            proxy_sockets_.erase(it);
         }
 
         /**
