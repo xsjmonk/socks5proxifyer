@@ -55,17 +55,42 @@ public:
      * @brief Adds a SOCKS5 proxy to the gateway.
      * @param endpoint The proxy endpoint in "IP:Port" format.
      * @param protocol The supported protocol(s) for the proxy.
+     * @param address_family The supported destination address family/families.
      * @param start Whether to start the proxy immediately.
      * @param login Optional username for authentication.
      * @param password Optional password for authentication.
-     * @return A handle (LONG_PTR) to the proxy instance, or 0 on failure.
+     * @param transport Upstream transport used to reach the SOCKS5 proxy.
+     * @param tls_server_name Server name used for TLS SNI and certificate validation.
+     * @param tls_pinned_cert_sha256 Optional SHA-256 certificate fingerprint pin.
+     * @param tls_allow_invalid_certificate Whether to bypass normal certificate validation.
+     * @return A handle (LONG_PTR) to the proxy instance, or -1 on failure.
+     */
+    [[nodiscard]] LONG_PTR add_socks5_proxy(
+        const std::string& endpoint,
+        supported_protocols_mx protocol,
+        supported_address_families_mx address_family,
+        bool start = false,
+        const std::string& login = "",
+        const std::string& password = "",
+        socks5_transport_mx transport = socks5_transport_mx::tcp,
+        const std::string& tls_server_name = "",
+        const std::string& tls_pinned_cert_sha256 = "",
+        bool tls_allow_invalid_certificate = false
+    ) const;
+
+    /**
+     * @brief Adds a SOCKS5 proxy with both IPv4 and IPv6 destinations enabled.
      */
     [[nodiscard]] LONG_PTR add_socks5_proxy(
         const std::string& endpoint,
         supported_protocols_mx protocol,
         bool start = false,
         const std::string& login = "",
-        const std::string& password = ""
+        const std::string& password = "",
+        socks5_transport_mx transport = socks5_transport_mx::tcp,
+        const std::string& tls_server_name = "",
+        const std::string& tls_pinned_cert_sha256 = "",
+        bool tls_allow_invalid_certificate = false
     ) const;
 
     [[nodiscard]] bool associate_process_name_to_proxy(

@@ -8,6 +8,7 @@ using Newtonsoft.Json;
 using NLog;
 using NLog.Config;
 using NLog.Targets;
+using System.Security.Principal;
 using Topshelf;
 using Socksifier;
 
@@ -102,19 +103,15 @@ namespace ProxiFyre
 
             foreach (var appSettings in serviceSettings.Proxies)
             {
-                // Warn on a half-specified credential: SOCKS5 username/password auth needs
-                // both, so providing only one silently falls back to no authentication.
-                var hasUser = !string.IsNullOrEmpty(appSettings.Username);
-                var hasPass = !string.IsNullOrEmpty(appSettings.Password);
-                if (hasUser != hasPass)
-                    LoggerInstance.Warn(
-                        $"Proxy {appSettings.Socks5ProxyEndpoint}: only one of username/password is set; " +
-                        "authentication will be skipped. Provide both or neither.");
-
                 // Add the defined SOCKS5 proxies
                 var proxy = _socksify.AddSocks5Proxy(appSettings.Socks5ProxyEndpoint, appSettings.Username,
                     appSettings.Password, appSettings.SupportedProtocolsParse,
-                    true); // Assuming the AddSocks5Proxy method supports a list of protocols
+                    appSettings.SupportedAddressFamiliesParse,
+                    appSettings.Socks5TransportParse,
+                    appSettings.EffectiveTlsServerName,
+                    NormalizeFingerprint(appSettings.TlsPinnedSha256),
+                    appSettings.TlsAllowInvalidCertificate,
+                    true);
 
                 if (proxy.ToInt64() == -1)
                 {
@@ -126,11 +123,17 @@ namespace ProxiFyre
                 var protocols = appSettings.SupportedProtocols != null && appSettings.SupportedProtocols.Count > 0
                     ? string.Join(", ", appSettings.SupportedProtocols)
                     : "TCP, UDP";
+                var addressFamilies = appSettings.SupportedAddressFamilies != null && appSettings.SupportedAddressFamilies.Count > 0
+                    ? string.Join(", ", appSettings.SupportedAddressFamilies)
+                    : "IPv4, IPv6";
+                var transport = appSettings.Socks5TransportParse == Socks5TransportEnum.TLS
+                    ? "SOCKS5Tls"
+                    : "SOCKS5";
                 foreach (var appName in appSettings.AppNames)
                     // Associate the defined application names to the proxies
                     if (_socksify.AssociateProcessNameToProxy(appName, proxy) && _logLevel >= LogLevel.Info)
                         LoggerInstance.Info(
-                            $"Successfully associated {appName} to {appSettings.Socks5ProxyEndpoint} SOCKS5 proxy with protocols {protocols}!");
+                            $"Successfully associated {appName} to {appSettings.Socks5ProxyEndpoint} {transport} proxy with protocols {protocols} and address families {addressFamilies}!");
             }
 
             foreach (var excludedEntry in serviceSettings.ExcludedList)
@@ -224,6 +227,16 @@ namespace ProxiFyre
                     throw new InvalidOperationException(message);
                 }
 
+                var hasUsername = !string.IsNullOrEmpty(proxy.Username);
+                var hasPassword = !string.IsNullOrEmpty(proxy.Password);
+                if (hasUsername != hasPassword)
+                {
+                    var message = $"Proxy '{proxy.Socks5ProxyEndpoint}' must specify both \"username\" and " +
+                                  "\"password\", or leave both empty.";
+                    LoggerInstance.Error(message);
+                    throw new InvalidOperationException(message);
+                }
+
                 // Drop null and whitespace-only application names (a null String^ throws in
                 // marshal_as<std::wstring>, and "   " is a typo that matches nothing), but PRESERVE
                 // an explicit empty string "": it is the catch-all that matches EVERY process (see
@@ -254,19 +267,67 @@ namespace ProxiFyre
                 }
 
                 // Warn on unrecognized protocol tokens: SupportedProtocolsParse only counts
-                // "TCP"/"UDP" and ignores anything else, defaulting to BOTH only when neither
-                // is present -- so a typo alongside a valid token is silently dropped, and a
-                // typo on its own silently proxies both protocols.
+                // "TCP"/"UDP" (case-insensitively) and ignores anything else, defaulting to
+                // BOTH only when neither is present -- so a typo alongside a valid token is
+                // silently dropped, and a typo on its own silently proxies both protocols.
                 if (proxy.SupportedProtocols != null)
                 {
                     var unknownProtocols = proxy.SupportedProtocols
-                        .Where(p => p != "TCP" && p != "UDP")
+                        .Where(p => !string.Equals(p, "TCP", StringComparison.OrdinalIgnoreCase) &&
+                                    !string.Equals(p, "UDP", StringComparison.OrdinalIgnoreCase))
                         .ToList();
                     if (unknownProtocols.Count > 0)
+                    {
+                        var values = string.Join(", ", unknownProtocols.Select(p => p ?? "<null>"));
                         LoggerInstance.Warn(
                             $"Proxy '{proxy.Socks5ProxyEndpoint}' lists unrecognized protocol(s): " +
-                            $"{string.Join(", ", unknownProtocols)}. Only \"TCP\" and \"UDP\" are recognized; " +
+                            $"{values}. Only \"TCP\" and \"UDP\" are recognized; " +
                             "unrecognized tokens are ignored (a proxy with no recognized protocol defaults to both).");
+                    }
+                }
+
+                if (proxy.SupportedAddressFamilies != null)
+                {
+                    if (proxy.SupportedAddressFamilies.Count == 0)
+                    {
+                        var message = $"Proxy '{proxy.Socks5ProxyEndpoint}' has an empty " +
+                                      "\"supportedAddressFamilies\" array. Omit the setting to enable both " +
+                                      "families, or specify \"IPv4\", \"IPv6\", or both.";
+                        LoggerInstance.Error(message);
+                        throw new InvalidOperationException(message);
+                    }
+
+                    var unknownAddressFamilies = proxy.SupportedAddressFamilies
+                        .Where(f => !string.Equals(f, "IPv4", StringComparison.OrdinalIgnoreCase) &&
+                                    !string.Equals(f, "IPv6", StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                    if (unknownAddressFamilies.Count > 0)
+                    {
+                        var values = string.Join(", ", unknownAddressFamilies.Select(f => f ?? "<null>"));
+                        var message = $"Proxy '{proxy.Socks5ProxyEndpoint}' lists unrecognized address " +
+                                      $"family/families: {values}. Only \"IPv4\" and \"IPv6\" are valid.";
+                        LoggerInstance.Error(message);
+                        throw new InvalidOperationException(message);
+                    }
+                }
+
+                var transport = proxy.Socks5TransportParse;
+                if (transport == Socks5TransportEnum.TLS)
+                {
+                    if (!string.IsNullOrWhiteSpace(proxy.TlsPinnedSha256) && !IsSha256Fingerprint(proxy.TlsPinnedSha256))
+                    {
+                        var message = $"Proxy '{proxy.Socks5ProxyEndpoint}' has an invalid " +
+                                      "\"tlsPinnedSha256\" value. Use a 64-character hex SHA-256 certificate fingerprint.";
+                        LoggerInstance.Error(message);
+                        throw new InvalidOperationException(message);
+                    }
+
+                    if (proxy.TlsAllowInvalidCertificate && string.IsNullOrWhiteSpace(proxy.TlsPinnedSha256))
+                    {
+                        LoggerInstance.Warn(
+                            $"Proxy '{proxy.Socks5ProxyEndpoint}' allows invalid TLS certificates without a certificate pin. " +
+                            "This disables upstream identity verification.");
+                    }
                 }
             }
 
@@ -274,6 +335,20 @@ namespace ProxiFyre
             settings.ExcludedList.RemoveAll(string.IsNullOrWhiteSpace);
 
             return settings;
+        }
+
+        private static bool IsSha256Fingerprint(string value)
+        {
+            var normalized = NormalizeFingerprint(value);
+            return normalized.Length == 64 && normalized.All(Uri.IsHexDigit);
+        }
+
+        private static string NormalizeFingerprint(string value)
+        {
+            return new string((value ?? string.Empty)
+                .Where(c => c != ':' && c != '-' && !char.IsWhiteSpace(c))
+                .Select(char.ToLowerInvariant)
+                .ToArray());
         }
 
         /// <summary>
@@ -313,14 +388,16 @@ namespace ProxiFyre
         //            "socks5ProxyEndpoint": "158.101.205.51:1080",
         //            "username": "username1",
         //            "password": "password1",
-        //            "supportedProtocols": ["TCP", "UDP"]
+        //            "supportedProtocols": ["TCP", "UDP"],
+        //            "supportedAddressFamilies": ["IPv4", "IPv6"]
         //        },
         //        {
         //            "appNames": ["firefox", "firefox_dev"],
         //            "socks5ProxyEndpoint": "159.101.205.52:1080",
         //            "username": "username2",
         //            "password": "password2",
-        //            "supportedProtocols": ["TCP"]
+        //            "supportedProtocols": ["TCP"],
+        //            "supportedAddressFamilies": ["IPv4"]
         //        }
         //    ],
         //    "excludes": [
@@ -388,13 +465,22 @@ namespace ProxiFyre
             /// <param name="username">Username for proxy authentication.</param>
             /// <param name="password">Password for proxy authentication.</param>
             /// <param name="supportedProtocols">List of supported protocols (e.g., TCP, UDP).</param>
-            public AppSettings(List<string> appNames, string socks5ProxyEndpoint, string username, string password, List<string> supportedProtocols)
+            /// <param name="supportedAddressFamilies">List of supported destination address families (e.g., IPv4, IPv6).</param>
+            public AppSettings(List<string> appNames, string socks5ProxyEndpoint, string username, string password,
+                List<string> supportedProtocols, List<string> supportedAddressFamilies = null,
+                string socks5Transport = null, string tlsServerName = null, string tlsPinnedSha256 = null,
+                bool tlsAllowInvalidCertificate = false)
             {
                 AppNames = appNames;
                 Socks5ProxyEndpoint = socks5ProxyEndpoint;
                 Username = username;
                 Password = password;
                 SupportedProtocols = supportedProtocols;
+                SupportedAddressFamilies = supportedAddressFamilies;
+                Socks5Transport = socks5Transport;
+                TlsServerName = tlsServerName;
+                TlsPinnedSha256 = tlsPinnedSha256;
+                TlsAllowInvalidCertificate = tlsAllowInvalidCertificate;
             }
 
             /// <summary>
@@ -423,21 +509,135 @@ namespace ProxiFyre
             public List<string> SupportedProtocols { get; }
 
             /// <summary>
+            /// Gets the list of supported destination address families (e.g., IPv4, IPv6).
+            /// </summary>
+            public List<string> SupportedAddressFamilies { get; }
+
+            /// <summary>
+            /// Gets the upstream transport used to reach the SOCKS5 proxy.
+            /// </summary>
+            public string Socks5Transport { get; }
+
+            /// <summary>
+            /// Gets the TLS SNI and certificate validation server name.
+            /// </summary>
+            public string TlsServerName { get; }
+
+            /// <summary>
+            /// Gets the optional SHA-256 certificate fingerprint pin.
+            /// </summary>
+            public string TlsPinnedSha256 { get; }
+
+            /// <summary>
+            /// Gets a value indicating whether invalid TLS certificates are allowed.
+            /// </summary>
+            public bool TlsAllowInvalidCertificate { get; }
+
+            /// <summary>
+            /// Gets the effective TLS server name, defaulting to the endpoint host.
+            /// </summary>
+            public string EffectiveTlsServerName
+            {
+                get
+                {
+                    return string.IsNullOrWhiteSpace(TlsServerName)
+                        ? ExtractEndpointHost(Socks5ProxyEndpoint)
+                        : TlsServerName.Trim();
+                }
+            }
+
+            /// <summary>
             /// Gets the supported protocols as an enum value.
             /// </summary>
             public SupportedProtocolsEnum SupportedProtocolsParse
             {
                 get
                 {
+                    var supportsTcp = ContainsProtocol("TCP");
+                    var supportsUdp = ContainsProtocol("UDP");
                     if (SupportedProtocols == null || SupportedProtocols.Count == 0 ||
-                        (SupportedProtocols.Contains("TCP") && SupportedProtocols.Contains("UDP")))
+                        (supportsTcp && supportsUdp))
                         return SupportedProtocolsEnum.BOTH;
-                    if (SupportedProtocols.Contains("TCP"))
+                    if (supportsTcp)
                         return SupportedProtocolsEnum.TCP;
-                    return SupportedProtocols.Contains("UDP")
+                    return supportsUdp
                         ? SupportedProtocolsEnum.UDP
                         : SupportedProtocolsEnum.BOTH;
                 }
+            }
+
+            /// <summary>
+            /// Gets the upstream SOCKS5 transport as an enum value.
+            /// </summary>
+            public Socks5TransportEnum Socks5TransportParse
+            {
+                get
+                {
+                    var transport = Socks5Transport?.Trim();
+                    if (string.IsNullOrEmpty(transport) ||
+                        string.Equals(transport, "TCP", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(transport, "Plain", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(transport, "SOCKS5", StringComparison.OrdinalIgnoreCase))
+                        return Socks5TransportEnum.TCP;
+
+                    if (string.Equals(transport, "TLS", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(transport, "SOCKS5TLS", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(transport, "SOCKS5_TLS", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(transport, "SOCKS5-TLS", StringComparison.OrdinalIgnoreCase))
+                        return Socks5TransportEnum.TLS;
+
+                    throw new InvalidOperationException(
+                        "socks5Transport must be TCP or TLS.");
+                }
+            }
+
+            /// <summary>
+            /// Gets the supported destination address families as an enum value.
+            /// </summary>
+            public SupportedAddressFamiliesEnum SupportedAddressFamiliesParse
+            {
+                get
+                {
+                    if (SupportedAddressFamilies == null)
+                        return SupportedAddressFamiliesEnum.BOTH;
+
+                    var supportsIPv4 = ContainsAddressFamily("IPv4");
+                    var supportsIPv6 = ContainsAddressFamily("IPv6");
+                    if (supportsIPv4 && supportsIPv6)
+                        return SupportedAddressFamiliesEnum.BOTH;
+                    if (supportsIPv4)
+                        return SupportedAddressFamiliesEnum.IPv4;
+                    if (supportsIPv6)
+                        return SupportedAddressFamiliesEnum.IPv6;
+
+                    throw new InvalidOperationException(
+                        "supportedAddressFamilies must contain IPv4, IPv6, or both.");
+                }
+            }
+
+            private bool ContainsAddressFamily(string value)
+            {
+                return SupportedAddressFamilies != null &&
+                    SupportedAddressFamilies.Any(f => string.Equals(f, value, StringComparison.OrdinalIgnoreCase));
+            }
+
+            private bool ContainsProtocol(string value)
+            {
+                return SupportedProtocols != null &&
+                    SupportedProtocols.Any(p => string.Equals(p, value, StringComparison.OrdinalIgnoreCase));
+            }
+
+            private static string ExtractEndpointHost(string endpoint)
+            {
+                var value = (endpoint ?? string.Empty).Trim();
+                if (value.StartsWith("[", StringComparison.Ordinal))
+                {
+                    var end = value.IndexOf(']');
+                    return end > 1 ? value.Substring(1, end - 1) : value;
+                }
+
+                var colon = value.LastIndexOf(':');
+                return colon > 0 ? value.Substring(0, colon) : value;
             }
         }
     }
@@ -447,6 +647,21 @@ namespace ProxiFyre
     /// </summary>
     internal class ServiceProgram
     {
+        private static bool IsElevated()
+        {
+            try
+            {
+                using (var identity = WindowsIdentity.GetCurrent())
+                {
+                    return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         /// <summary>
         /// Main method. Configures and runs the ProxiFyre service using Topshelf.
         /// </summary>
@@ -468,6 +683,20 @@ namespace ProxiFyre
                                      || command == "uninstall"
                                      || command == "start"
                                      || command == "stop";
+
+            var isHelpCommand = command == "help"
+                                || command == "--help"
+                                || command == "-h"
+                                || command == "/?";
+
+            if (!isLifecycleCommand && !isHelpCommand && !IsElevated())
+            {
+                Console.Error.WriteLine(
+                    "ProxiFyre must run with administrator privileges so process ownership, " +
+                    "application exclusions, and packet redirection remain reliable. Start it from " +
+                    "an Administrator console or install and start the Windows service.");
+                return 5; // ERROR_ACCESS_DENIED
+            }
 
             var originalOut = Console.Out;
             var originalError = Console.Error;
