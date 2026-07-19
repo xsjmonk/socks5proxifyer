@@ -1274,30 +1274,7 @@ namespace proxy
             // proxy_servers_ has already missed) or with stop().
             std::scoped_lock lifecycle_lock(lifecycle_mutex_);
 
-            // Construct filter objects for the TCP and UDP traffic to and from the proxy server
-            // These filters are used to decide which packets to pass or drop
-            // They are configured to match packets based on their source/destination IP and port numbers
-            // and their protocol (TCP or UDP)
-            auto create_filter = [](const uint8_t protocol, const ndisapi::direction_t direction,
-                const net::ip_address_v4& address, const uint16_t port)
-            {
-                ndisapi::filter<net::ip_address_v4> filter;
-                filter.set_protocol(protocol)
-                      .set_direction(direction)
-                      .set_action(ndisapi::action_t::pass)
-                    .set_dest_address(net::ip_subnet{ address, net::ip_address_v4{"255.255.255.255"} })
-                      .set_dest_port(std::make_pair(port, port));
-                return filter;
-            };
 
-            const auto tcp_out_filter = create_filter(IPPROTO_TCP, ndisapi::direction_t::out, proxy_endpoint.value().ip,
-                                                      proxy_endpoint.value().port);
-            const auto tcp_in_filter = create_filter(IPPROTO_TCP, ndisapi::direction_t::in, proxy_endpoint.value().ip,
-                                                     proxy_endpoint.value().port);
-            const auto udp_out_filter = create_filter(IPPROTO_UDP, ndisapi::direction_t::out, proxy_endpoint.value().ip,
-                                                      proxy_endpoint.value().port);
-            const auto udp_in_filter = create_filter(IPPROTO_UDP, ndisapi::direction_t::in, proxy_endpoint.value().ip,
-                                                     proxy_endpoint.value().port);
 
             // NOTE: the static PASS filters for the upstream endpoint are installed only AFTER
             // the proxy pair is successfully built and (optionally) started -- see below, just
