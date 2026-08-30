@@ -55,6 +55,41 @@ function Invoke-Build {
     }
 }
 
+function Invoke-Restore {
+    param(
+        [string]$MSBuildPath,
+        [string]$SolutionPath
+    )
+
+    Write-Info "Restoring NuGet packages required by native projects"
+    $arguments = @(
+        $SolutionPath
+        "/t:Restore"
+        "/p:RestoreConfigFile=$(Join-Path $root "NuGet.Installer.Config")"
+        "/p:RestoreLockedMode=false"
+        "/nologo"
+        "/verbosity:minimal"
+    )
+
+    & $MSBuildPath @arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Package restore failed with exit code $LASTEXITCODE."
+    }
+
+    $nuget = Get-Command nuget.exe -ErrorAction SilentlyContinue
+    if (-not $nuget) {
+        throw "nuget.exe was not found. Install NuGet to restore packages.config dependencies."
+    }
+
+    Write-Info "Restoring packages.config dependencies from the solution"
+    & $nuget.Source restore $SolutionPath `
+        -ConfigFile (Join-Path $root "NuGet.Installer.Config") `
+        -NonInteractive
+    if ($LASTEXITCODE -ne 0) {
+        throw "packages.config restore failed with exit code $LASTEXITCODE."
+    }
+}
+
 function Copy-DirectoryContents {
     param(
         [string]$SourceDir,
@@ -77,6 +112,29 @@ function Remove-IfExists {
     }
 }
 
+function Get-SolutionProjectDirectories {
+    param([string]$SolutionPath)
+
+    $lines = & dotnet sln $SolutionPath list
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not read projects from solution: $SolutionPath"
+    }
+
+    foreach ($line in $lines) {
+        $relativeProjectPath = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($relativeProjectPath) -or
+            $relativeProjectPath -eq "Project(s)" -or
+            $relativeProjectPath -match "^-+$") {
+            continue
+        }
+
+        $projectPath = Join-Path (Split-Path -Parent $SolutionPath) $relativeProjectPath
+        if (Test-Path $projectPath) {
+            Split-Path -Parent $projectPath
+        }
+    }
+}
+
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $solution = Join-Path $root "socksify.sln"
 $buildDir = Join-Path $root "Build"
@@ -89,6 +147,7 @@ $msbuild = Get-MSBuildPath
 Write-Info "Using MSBuild: $msbuild"
 Write-Info "Building $solution ($Configuration|$Platform)"
 
+Invoke-Restore -MSBuildPath $msbuild -SolutionPath $solution
 Invoke-Build -MSBuildPath $msbuild -SolutionPath $solution -ConfigurationName $Configuration -PlatformName $Platform
 
 Write-Info "Refreshing Build folder"
@@ -106,14 +165,15 @@ foreach ($entry in $outputRoots) {
 }
 
 Write-Info "Removing intermediate and original output folders"
-$cleanupTargets = @(
-    (Join-Path $root "bin")
-    (Join-Path $root "ProxiFyre\obj")
-    (Join-Path $root "ndisapi.lib\$Platform")
-    (Join-Path $root "socksify\$Platform")
-)
+$cleanupTargets = [System.Collections.Generic.List[string]]::new()
+$cleanupTargets.Add((Join-Path $root "bin"))
 
-foreach ($target in $cleanupTargets) {
+foreach ($projectDirectory in Get-SolutionProjectDirectories -SolutionPath $solution) {
+    $cleanupTargets.Add((Join-Path $projectDirectory "obj"))
+    $cleanupTargets.Add((Join-Path $projectDirectory $Platform))
+}
+
+foreach ($target in ($cleanupTargets | Select-Object -Unique)) {
     Remove-IfExists $target
 }
 
