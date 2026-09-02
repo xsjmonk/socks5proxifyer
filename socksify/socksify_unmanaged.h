@@ -23,19 +23,44 @@ namespace proxy
  */
 class socksify_unmanaged  // NOLINT(clang-diagnostic-padded)
 {
-    explicit socksify_unmanaged(log_level_mx log_level);
+    /**
+     * @brief Constructs a socksify_unmanaged instance with the specified log level.
+     * @param log_level The logging level to use for the proxy gateway.
+     * @param bypass_unresolved_processes Whether unresolved process owners must remain direct.
+     */
+    explicit socksify_unmanaged(log_level_mx log_level, bool bypass_unresolved_processes);
 
 public:
+    /**
+     * @brief Destructor for socksify_unmanaged. Cleans up resources.
+     */
     ~socksify_unmanaged();
 
+    // Deleted copy/move constructors and assignment operators to enforce singleton semantics.
     socksify_unmanaged(const socksify_unmanaged& other) = delete;
     socksify_unmanaged(socksify_unmanaged&& other) = delete;
     socksify_unmanaged& operator=(const socksify_unmanaged& other) = delete;
     socksify_unmanaged& operator=(socksify_unmanaged&& other) = delete;
 
-    static socksify_unmanaged* get_instance(log_level_mx log_level = log_level_mx::all);
+    /**
+     * @brief Gets the singleton instance of socksify_unmanaged.
+     * @param log_level The logging level to use (default: log_level_mx::all).
+     * @param bypass_unresolved_processes Whether unresolved process owners must remain direct.
+     * @return Pointer to the singleton instance.
+     */
+    static socksify_unmanaged* get_instance(log_level_mx log_level = log_level_mx::all,
+        bool bypass_unresolved_processes = false);
 
+    /**
+     * @brief Starts the proxy gateway and network filter.
+     * @return True if started successfully, false otherwise.
+     */
     [[nodiscard]] bool start() const;
+
+    /**
+     * @brief Stops the proxy gateway and network filter.
+     * @return True if stopped successfully, false otherwise.
+     */
     [[nodiscard]] bool stop() const;
 
     /**
@@ -93,26 +118,64 @@ public:
         bool tls_allow_invalid_certificate = false
     ) const;
 
+    /**
+     * @brief Associates a process name with a specific proxy.
+     * @param process_name The process name to associate.
+     * @param proxy_id The handle of the proxy to associate with.
+     * @return True if association was successful, false otherwise.
+     */
     [[nodiscard]] bool associate_process_name_to_proxy(
         const std::wstring& process_name,
         LONG_PTR proxy_id) const;
     [[nodiscard]] bool exclude_process_name(const std::wstring& process_name) const;
 
-    void set_log_limit(uint32_t log_limit);
-    [[nodiscard]] uint32_t get_log_limit();
-    void set_log_event(HANDLE log_event);
-    log_storage_mx_t read_log();
-
-    // --- NEW: wrappers for per-process destination CIDR management -----------
     [[nodiscard]] bool include_process_dst_cidr(const std::wstring& process_name,
                                                 const std::string& cidr) const;
     [[nodiscard]] bool remove_process_dst_cidr(const std::wstring& process_name,
                                                const std::string& cidr) const;
-    // -------------------------------------------------------------------------
+
+    /**
+     * @brief Sets the maximum number of log entries to keep.
+     * @param log_limit The new log limit.
+     */
+    void set_log_limit(uint32_t log_limit);
+
+    /**
+     * @brief Gets the current log limit.
+     * @return The log limit.
+     */
+    [[nodiscard]] uint32_t get_log_limit();
+
+    /**
+     * @brief Sets the event handle to signal when log limit is exceeded.
+     * @param log_event The Windows event handle.
+     */
+    void set_log_event(HANDLE log_event);
+
+    /**
+     * @brief Reads and clears the log storage.
+     * @return The log storage as a log_storage_mx_t object.
+     */
+    log_storage_mx_t read_log();
 
 private:
+    /**
+     * @brief Static helper for printing log messages.
+     * @param log The message to log.
+     */
     static void log_printer(const char* log);
+
+    /**
+     * @brief Static helper for logging events.
+     * @param log The event to log.
+     */
     static void log_event(event_mx log);
+
+    /**
+     * @brief Prints a log message at the specified log level.
+     * @param level The log level.
+     * @param message The message to print.
+     */
     void print_log(log_level_mx level, const std::string& message) const;
 
     std::string address_; ///< The address for the proxy (if applicable).
@@ -123,4 +186,5 @@ private:
     /// </summary>
     std::optional<std::ofstream> pcap_log_file_;
     log_level_mx log_level_{ log_level_mx::error }; ///< The current log level.
+    const bool bypass_unresolved_processes_{ false }; ///< Immutable unresolved-owner routing policy.
 };

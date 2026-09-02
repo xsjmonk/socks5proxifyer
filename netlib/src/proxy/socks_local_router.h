@@ -1,5 +1,7 @@
 #pragma once
+
 #include <functional>
+#include "process_routing_policy.h"
 
 namespace proxy
 {
@@ -358,22 +360,23 @@ namespace proxy
          * @see log_packet_to_pcap()
          */
         std::shared_ptr<std::ostream> pcap_log_stream_;
+        std::function<bool(const std::wstring&, const sockaddr*, int)> redirect_decider_;
+
+        /**
+         * @brief When true, traffic whose owning process could not be resolved is never
+         *        matched to a proxy and therefore remains direct.
+         *
+         * This is used by the explicitly requested limited/unelevated console mode. The
+         * default is false so service and elevated operation retain the existing behavior,
+         * including catch-all mappings for the synthetic unresolved process.
+         */
+        bool bypass_unresolved_processes_{ false };
 
         /**
         * @brief Atomic boolean to track the active status of the router.
         */
         std::atomic_bool is_active_{ false };
 
-	public:
-	    using redirect_decider_t = std::function<bool(const std::wstring&, const sockaddr*, int)>;
-
-	    // Optional; if not set, legacy behavior (always redirect when associated) remains.
-	    void set_redirect_decider(redirect_decider_t cb) { redirect_decider_ = std::move(cb); }
-
-
-    private:
-        redirect_decider_t redirect_decider_; // empty => legacy behavior
-        // -----------------------------------------------------------------------
         /**
          * @brief Atomic flag that signals the deferred-resolve thread to exit.
          *
@@ -527,15 +530,19 @@ namespace proxy
          *                  For instance, if log_level > netlib::log::log_level::debug, the router creates a pcap file for capturing network packets.
          * @param log_stream Optional reference to an output stream for logging.
          * @param pcap_log_stream Optional reference to an output stream for pcap logging.
+         * @param bypass_unresolved_processes When true, traffic with an unresolved process
+         *        owner is kept direct instead of being eligible for application matching.
          */
         explicit socks_local_router(const log_level log_level = log_level::error,
                                     std::shared_ptr<std::ostream> log_stream = nullptr,
-                                    std::shared_ptr<std::ostream> pcap_log_stream = nullptr) :
+                                    std::shared_ptr<std::ostream> pcap_log_stream = nullptr,
+                                    const bool bypass_unresolved_processes = false) :
                                     logger(log_level, std::move(log_stream)),
                                     static_filters_{ true, true, log_level_, log_stream_ },
                                     process_lookup_v4_{ log_level_, log_stream_ },
                                     process_lookup_v6_{ log_level_, log_stream_ },
-                                    pcap_log_stream_(std::move(pcap_log_stream))
+                                    pcap_log_stream_(std::move(pcap_log_stream)),
+                                    bypass_unresolved_processes_(bypass_unresolved_processes)
         {
             using namespace std::string_literals;
 
@@ -633,8 +640,8 @@ namespace proxy
                 if (is_active_.load(std::memory_order_acquire))
                 {
                     NETLIB_DEBUG("Destructor calling stop()");
-            stop();
-        }
+                    stop();
+                }
             }
             catch (const std::exception& e)
             {
@@ -951,7 +958,7 @@ namespace proxy
             }
 
             if (udp_redirect_)
-                {
+            {
                 udp_redirect_->stop();  // This should join the cleanup thread
             }
 
@@ -984,7 +991,7 @@ namespace proxy
                 {
                     NETLIB_DEBUG("Stopping IPv4 UDP proxy #{} on port {}", i, proxy_servers_[i].second->proxy_port());
                     proxy_servers_[i].second->stop();
-            }
+                }
             }
 
             NETLIB_DEBUG("Stopping {} IPv6 proxy pairs", proxy_servers_v6_.size());
@@ -1072,6 +1079,13 @@ namespace proxy
         {
             add_lan_passover_filters_v4();
             add_lan_passover_filters_v6();
+        }
+
+        using redirect_decider_t = std::function<bool(const std::wstring&, const sockaddr*, int)>;
+
+        void set_redirect_decider(redirect_decider_t callback)
+        {
+            redirect_decider_ = std::move(callback);
         }
 
         /**
@@ -1274,44 +1288,10 @@ namespace proxy
             // proxy_servers_ has already missed) or with stop().
             std::scoped_lock lifecycle_lock(lifecycle_mutex_);
 
-            // Preserve the July behavior: install the upstream PASS filters
-            // before creating proxy listeners and keep successful entries even
-            // when a later driver insertion is rejected.
-            const auto create_filter = [](const uint8_t protocol,
-                                          const ndisapi::direction_t direction,
-                                          const net::ip_address_v4& address,
-                                          const uint16_t port)
-            {
-                ndisapi::filter<net::ip_address_v4> filter;
-                filter.set_protocol(protocol)
-                    .set_direction(direction)
-                    .set_action(ndisapi::action_t::pass)
-                    .set_dest_address(net::ip_subnet{ address, net::ip_address_v4{"255.255.255.255"} })
-                    .set_dest_port(std::make_pair(port, port));
-                return filter;
-            };
-
-            const auto tcp_out_filter = create_filter(
-                IPPROTO_TCP, ndisapi::direction_t::out, proxy_endpoint->ipv4->ip, proxy_endpoint->ipv4->port);
-            const auto tcp_in_filter = create_filter(
-                IPPROTO_TCP, ndisapi::direction_t::in, proxy_endpoint->ipv4->ip, proxy_endpoint->ipv4->port);
-            const auto udp_out_filter = create_filter(
-                IPPROTO_UDP, ndisapi::direction_t::out, proxy_endpoint->ipv4->ip, proxy_endpoint->ipv4->port);
-            const auto udp_in_filter = create_filter(
-                IPPROTO_UDP, ndisapi::direction_t::in, proxy_endpoint->ipv4->ip, proxy_endpoint->ipv4->port);
-
-            if (protocols == both || protocols == udp)
-            {
-                static_filters_.add_filter_back(tcp_out_filter);
-                static_filters_.add_filter_back(tcp_in_filter);
-                static_filters_.add_filter_back(udp_out_filter);
-                static_filters_.add_filter_back(udp_in_filter);
-            }
-            else if (protocols == tcp)
-            {
-                static_filters_.add_filter_back(tcp_out_filter);
-                static_filters_.add_filter_back(tcp_in_filter);
-            }
+            // NOTE: the static PASS filters for the upstream endpoint are installed only AFTER
+            // the proxy pair is successfully built and (optionally) started -- see below, just
+            // before proxy_servers_ is updated. Installing them here (before build/start) leaked
+            // orphaned driver filters on every failure path.
 
             try
             {
@@ -1453,14 +1433,118 @@ namespace proxy
                     }
                 }
 
-                // Reserve every index-aligned vector before publishing the
-                // proxy pair below.
+                // Reserve every index-aligned vector before touching the driver
+                // filter table. Once these reserves succeed, publishing the proxy
+                // pair below consists only of noexcept moves/copies.
                 {
                     std::scoped_lock lock(lock_);
                     proxy_servers_.reserve(proxy_servers_.size() + 1);
                     proxy_servers_v6_.reserve(proxy_servers_v6_.size() + 1);
                     proxy_protocols_.reserve(proxy_protocols_.size() + 1);
                     proxy_address_families_.reserve(proxy_address_families_.size() + 1);
+                }
+
+                // Install PASS filters only for upstream addresses selected by
+                // listeners that survived construction/start. Inbound filters match
+                // the proxy as the packet source; outbound filters match it as the
+                // destination.
+                const auto install_upstream_filters = [this, protocols](const auto& upstream) -> bool  // NOLINT(clang-diagnostic-padded)
+                {
+                    using address_t = std::remove_cvref_t<decltype(upstream.ip)>;
+                    const auto mask = []
+                    {
+                        if constexpr (std::is_same_v<address_t, net::ip_address_v4>)
+                            return net::ip_address_v4{ "255.255.255.255" };
+                        else
+                            return net::ip_address_v6{ "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff" };
+                    }();
+                    const net::ip_subnet<address_t> subnet{ upstream.ip, mask };
+
+                    const auto create_filter = [&subnet, &upstream](const uint8_t protocol,
+                                                                    const ndisapi::direction_t direction,
+                                                                    const bool match_configured_port)
+                    {
+                        ndisapi::filter<address_t> filter;
+                        filter.set_protocol(protocol)
+                            .set_direction(direction)
+                            .set_action(ndisapi::action_t::pass);
+
+                        if (direction == ndisapi::direction_t::in)
+                        {
+                            filter.set_source_address(subnet);
+                            if (match_configured_port)
+                                filter.set_source_port(std::make_pair(upstream.port, upstream.port));
+                        }
+                        else
+                        {
+                            filter.set_dest_address(subnet);
+                            if (match_configured_port)
+                                filter.set_dest_port(std::make_pair(upstream.port, upstream.port));
+                        }
+
+                        return filter;  // NOLINT(clang-diagnostic-nrvo)
+                    };
+
+                    const auto first_filter_position = static_filters_.size();
+                    const auto rollback = [this, first_filter_position]
+                    {
+                        while (static_filters_.size() > first_filter_position)
+                        {
+                            if (!static_filters_.remove_filter(static_cast<uint32_t>(first_filter_position)))
+                            {
+                                NETLIB_LOG(log_level::error,
+                                    "Failed to roll back an upstream PASS filter at position {}.",
+                                    first_filter_position);
+                                break;
+                            }
+                        }
+                    };
+
+                    try
+                    {
+                        const auto add_filter = [this, &rollback](const auto& filter)
+                        {
+                            if (static_filters_.add_filter_back(filter))
+                                return true;
+
+                            rollback();
+                            return false;
+                        };
+
+                        if (!add_filter(create_filter(IPPROTO_TCP, ndisapi::direction_t::out, true)) ||
+                            !add_filter(create_filter(IPPROTO_TCP, ndisapi::direction_t::in, true)))
+                            return false;
+
+                        if (protocol_supports_udp(protocols))
+                        {
+                            // UDP ASSOCIATE may return a relay port unrelated to the
+                            // configured SOCKS5 port. Exempt the proxy host's UDP traffic
+                            // by address so relay packets cannot be captured recursively.
+                            if (!add_filter(create_filter(IPPROTO_UDP, ndisapi::direction_t::out, false)) ||
+                                !add_filter(create_filter(IPPROTO_UDP, ndisapi::direction_t::in, false)))
+                                return false;
+                        }
+
+                        return true;
+                    }
+                    catch (...)
+                    {
+                        rollback();
+                        throw;
+                    }
+                };
+
+                const bool has_ipv4_listeners = socks_tcp_proxy_server || socks_udp_proxy_server;
+                const bool has_ipv6_listeners = socks_tcp_proxy_server_v6 || socks_udp_proxy_server_v6;
+
+                if ((has_ipv4_listeners || has_ipv6_listeners) && proxy_endpoint->ipv4)
+                {
+                    if (!install_upstream_filters(*proxy_endpoint->ipv4))
+                    {
+                        NETLIB_LOG(log_level::error,
+                            "Failed to install upstream PASS filters for SOCKS5 proxy {}.", endpoint);
+                        return {};
+                    }
                 }
 
                 // Lock the mutex to safely add the proxy servers to the shared data
@@ -1730,6 +1814,13 @@ namespace proxy
         bool match_app_name(const std::wstring& app, const std::shared_ptr<iphelper::network_process>& process) const
         {
             if (!process) return false;
+
+            // In explicitly enabled limited/unelevated mode, process attribution is
+            // best-effort. Never let an unresolved synthetic owner match either a named
+            // application or the empty catch-all pattern; its traffic must remain direct.
+            // The flag defaults to false, preserving the existing elevated/service behavior.
+            if (should_bypass_unresolved_process(bypass_unresolved_processes_, process->resolved))
+                return false;
 
             // Exclude the current process by process ID (not cached since it's a quick check)
             if (process->id == ::GetCurrentProcessId())
@@ -2011,7 +2102,6 @@ namespace proxy
          *         - std::nullopt: process could not be resolved (should be queued for later)
          *         - packet_action::revert: packet should be reverted (redirected)
          *         - packet_action::pass: packet should be passed through
-         * (unchanged comment)
          */
         std::optional<packet_filter::packet_action> process_udp_packet(netlib::ndisapi::intermediate_buffer& buffer, const bool postponed)
         {
@@ -2060,23 +2150,17 @@ namespace proxy
             if (process->excluded || process->bypass_udp)
                 return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
 
-            // -------- NEW: consult optional redirect decider (per-process CIDR include) --------
-			// Consult optional per-process destination include policy
-			if (redirect_decider_)
-			{
-			    sockaddr_in dst{};
-			    dst.sin_family = AF_INET;
-			    dst.sin_addr   = ip_header->ip_dst;      // <-- assign in_addr directly (fixes C2440)
-			    dst.sin_port   = udp_header->th_dport;   // already in network byte order
-
-			    if (!redirect_decider_(process->name, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)))
-			    {
-			        // Do NOT redirect this destination for this process
-			        return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
-			    }
-			}
-
-            // ------------------------------------------------------------------------------------
+            if (redirect_decider_)
+            {
+                sockaddr_in destination{};
+                destination.sin_family = AF_INET;
+                destination.sin_addr = ip_header->ip_dst;
+                destination.sin_port = udp_header->th_dport;
+                if (!redirect_decider_(process->name,
+                                       reinterpret_cast<const sockaddr*>(&destination),
+                                       sizeof(destination)))
+                    return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
+            }
 
             const auto proxy_lookup = process->udp_proxy_port
                 ? proxy_port_result{ proxy_port_action::proxy, process->udp_proxy_port.value() }
@@ -2128,15 +2212,15 @@ namespace proxy
          * @brief Processes a TCP packet for possible redirection through a proxy.
          *
          * This function inspects the provided intermediate_buffer, attempts to resolve the associated process,
-         * and determines if the UDP packet should be redirected to a proxy port, passed through, or reverted.
+         * and determines if the TCP packet should be redirected to a proxy port, passed through, or reverted.
          * If the process cannot be resolved and @p postponed is false, the function returns std::nullopt,
          * indicating that the packet should be queued for later processing. If @p postponed is true, a
          * second attempt is made to resolve the process using an updated process table.
          *
-         * If the process is associated with a UDP proxy, and the packet is from a new endpoint, the source
-         * port is recorded and a redirection is logged. The function then attempts to process the packet for
-         * client-to-server redirection. If the packet is from a known proxy port, it attempts to process it
-         * for server-to-client redirection.
+         * If the process is associated with a TCP proxy, and the packet is a SYN (connection initiation),
+         * the source port is mapped to the destination endpoint and a redirection is logged. The function
+         * then attempts to process the packet for client-to-server redirection. If the packet is from a
+         * known proxy port, it attempts to process it for server-to-client redirection.
          *
          * @param buffer Reference to the intermediate_buffer containing the packet data.
          * @param postponed If false, only the current process table is used for lookup. If true, the process
@@ -2145,7 +2229,6 @@ namespace proxy
          *         - std::nullopt: process could not be resolved (should be queued for later)
          *         - packet_action::revert: packet should be reverted (redirected)
          *         - packet_action::pass: packet should be passed through
-         * (unchanged comment)
          */
         std::optional<packet_filter::packet_action> process_tcp_packet(netlib::ndisapi::intermediate_buffer& buffer, const bool postponed)
         {
@@ -2190,23 +2273,17 @@ namespace proxy
             if (process->excluded || process->bypass_tcp)
                 return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
 
-            // -------- NEW: consult optional redirect decider (per-process CIDR include) --------
-			// Consult optional per-process destination include policy
-			if (redirect_decider_)
-			{
-			    sockaddr_in dst{};
-			    dst.sin_family = AF_INET;
-			    dst.sin_addr   = ip_header->ip_dst;      // <-- assign in_addr directly (fixes C2440)
-			    dst.sin_port   = tcp_header->th_dport;   // already in network byte order
-
-			    if (!redirect_decider_(process->name, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)))
-			    {
-			        // Do NOT redirect this destination for this process
-			        return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
-			    }
-			}
-
-            // ------------------------------------------------------------------------------------
+            if (redirect_decider_)
+            {
+                sockaddr_in destination{};
+                destination.sin_family = AF_INET;
+                destination.sin_addr = ip_header->ip_dst;
+                destination.sin_port = tcp_header->th_dport;
+                if (!redirect_decider_(process->name,
+                                       reinterpret_cast<const sockaddr*>(&destination),
+                                       sizeof(destination)))
+                    return packet_filter::packet_action{ packet_filter::packet_action::action_type::pass };
+            }
 
             const auto proxy_lookup = process->tcp_proxy_port
                 ? proxy_port_result{ proxy_port_action::proxy, process->tcp_proxy_port.value() }

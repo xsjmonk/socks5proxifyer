@@ -5,15 +5,25 @@
 
 // ReSharper disable CppInconsistentNaming
 
-Socksifier::Socksifier::Socksifier(LogLevel log_level)
+/// <summary>
+/// Initializes a new instance of the <see cref="Socksifier"/> class with the specified log level.
+/// Sets up the unmanaged core, log event, and starts the logging thread.
+/// </summary>
+/// <param name="log_level">The logging level to use.</param>
+/// <param name="bypassUnresolvedProcesses">Whether unresolved process owners must remain direct.</param>
+Socksifier::Socksifier::Socksifier(LogLevel log_level, const bool bypassUnresolvedProcesses)
 {
+    bypass_unresolved_processes_ = bypassUnresolvedProcesses;
+
     // Default poll interval (ms). Without this the field is 0 and log_thread() busy-spins
     // (WaitOne(0)) until the managed side assigns LogEventInterval.
     log_event_interval_ = 1000;
 
     try
     {
-        unmanaged_ptr_ = socksify_unmanaged::get_instance(static_cast<log_level_mx>(log_level));
+        unmanaged_ptr_ = socksify_unmanaged::get_instance(
+            static_cast<log_level_mx>(log_level),
+            bypassUnresolvedProcesses);
     }
     catch (const std::exception& exception)
     {
@@ -29,15 +39,14 @@ Socksifier::Socksifier::Socksifier(LogLevel log_level)
 
     log_event_ = gcnew Threading::AutoResetEvent(false);
     unmanaged_ptr_->set_log_event(static_cast<HANDLE>(log_event_->SafeWaitHandle->DangerousGetHandle()));
-
-    // Initialize a safe default before starting the logging thread.
-    // Program.cs may override this later (e.g., _socksify.LogEventInterval = 1000).
-    log_event_interval_ = 1000;
-
     logging_thread_ = gcnew Threading::Thread(gcnew Threading::ThreadStart(this, &Socksifier::log_thread));
     logging_thread_->Start();
 }
 
+/// <summary>
+/// Finalizer for the <see cref="Socksifier"/> class.
+/// Ensures the logging thread is stopped and unmanaged resources are released.
+/// </summary>
 Socksifier::Socksifier::!Socksifier()
 {
     // Set flag that we are going to exit
@@ -64,6 +73,10 @@ Socksifier::Socksifier::!Socksifier()
     }
 }
 
+/// <summary>
+/// Destructor for the <see cref="Socksifier"/> class.
+/// Calls the finalizer to clean up resources.
+/// </summary>
 Socksifier::Socksifier::~Socksifier()
 {
     this->!Socksifier();
@@ -76,6 +89,10 @@ Socksifier::Socksifier::~Socksifier()
         instance_ = nullptr;
 }
 
+/// <summary>
+/// Thread procedure for processing and dispatching log events.
+/// Waits for log events or interval, reads logs from the unmanaged core, and raises managed log events.
+/// </summary>
 void Socksifier::Socksifier::log_thread()
 {
     do
@@ -115,41 +132,73 @@ void Socksifier::Socksifier::log_thread()
                     }
                 }
 
-                // In C++/CLI, invoking the event directly is correct; it¡¯s safe if there are no subscribers.
                 LogEvent(this, gcnew LogEventArgs(managed_log_list));
             }
         }
     } while (logger_thread_active_);
 }
 
+/// <summary>
+/// Gets the current log limit from the unmanaged core.
+/// </summary>
+/// <returns>The log limit.</returns>
 UInt32 Socksifier::Socksifier::GetLogLimit()
 {
     return unmanaged_ptr_->get_log_limit();
 }
 
+/// <summary>
+/// Sets the log limit in the unmanaged core.
+/// </summary>
+/// <param name="value">The new log limit.</param>
 void Socksifier::Socksifier::SetLogLimit(const UInt32 value)
 {
     unmanaged_ptr_->set_log_limit(value);
 }
 
+/// <summary>
+/// Gets the singleton instance of the <see cref="Socksifier"/> class with the specified log level.
+/// </summary>
+/// <param name="log_level">The logging level to use.</param>
+/// <returns>The singleton instance.</returns>
 Socksifier::Socksifier^ Socksifier::Socksifier::GetInstance(const LogLevel log_level)
 {
-    if (instance_ == nullptr)
-    {
-        msclr::lock l(Socksifier::typeid);
+    return GetInstance(log_level, false);
+}
 
-        if (instance_ == nullptr)
-            instance_ = gcnew Socksifier(log_level);
-    }
+/// <summary>
+/// Gets the current singleton with an explicit unresolved-owner policy, creating it if needed.
+/// </summary>
+/// <param name="log_level">The logging level to use.</param>
+/// <param name="bypassUnresolvedProcesses">Whether unresolved process owners must remain direct.</param>
+/// <returns>The singleton instance.</returns>
+Socksifier::Socksifier^ Socksifier::Socksifier::GetInstance(const LogLevel log_level,
+    const bool bypassUnresolvedProcesses)
+{
+    msclr::lock l(Socksifier::typeid);
+
+    if (instance_ == nullptr)
+        instance_ = gcnew Socksifier(log_level, bypassUnresolvedProcesses);
+    else if (instance_->bypass_unresolved_processes_ != bypassUnresolvedProcesses)
+        throw gcnew InvalidOperationException(
+            "The Socksifier singleton is already initialized with a different unresolved-owner policy.");
 
     return instance_;
 }
 
+/// <summary>
+/// Gets the singleton instance of the <see cref="Socksifier"/> class with the default log level.
+/// </summary>
+/// <returns>The singleton instance.</returns>
 Socksifier::Socksifier^ Socksifier::Socksifier::GetInstance()
 {
     return GetInstance(LogLevel::All);
 }
 
+/// <summary>
+/// Starts the proxy gateway via the unmanaged core.
+/// </summary>
+/// <returns>True if started successfully, otherwise false.</returns>
 bool Socksifier::Socksifier::Start()
 {
     if (unmanaged_ptr_)
@@ -158,6 +207,10 @@ bool Socksifier::Socksifier::Start()
     return false;
 }
 
+/// <summary>
+/// Stops the proxy gateway via the unmanaged core.
+/// </summary>
+/// <returns>True if stopped successfully, otherwise false.</returns>
 bool Socksifier::Socksifier::Stop()
 {
     if (unmanaged_ptr_)
@@ -316,6 +369,12 @@ IntPtr Socksifier::Socksifier::AddSocks5Proxy(String^ endpoint, String^ username
     return AddSocks5Proxy(endpoint, username, password, protocols, SupportedAddressFamiliesEnum::BOTH, start);
 }
 
+/// <summary>
+/// Associates a process name with a specific proxy instance.
+/// </summary>
+/// <param name="processName">The process name to associate.</param>
+/// <param name="proxy">The proxy handle.</param>
+/// <returns>True if association was successful, otherwise false.</returns>
 bool Socksifier::Socksifier::AssociateProcessNameToProxy(String^ processName, IntPtr proxy)
 {
     if (!unmanaged_ptr_)
@@ -329,6 +388,11 @@ bool Socksifier::Socksifier::AssociateProcessNameToProxy(String^ processName, In
 #endif //_WIN64
 }
 
+/// <summary>
+/// Excludes a process from being tunnelled by the gateway.
+/// </summary>
+/// <param name="excludedEntry">The process name to exclude.</param>
+/// <returns>True if exclusion was successful, otherwise false.</returns>
 bool Socksifier::Socksifier::ExcludeProcessName(String^ excludedEntry)
 {
     if (!unmanaged_ptr_) {
@@ -337,7 +401,6 @@ bool Socksifier::Socksifier::ExcludeProcessName(String^ excludedEntry)
     return unmanaged_ptr_->exclude_process_name(msclr::interop::marshal_as<std::wstring>(excludedEntry));
 }
 
-// --- NEW: tiny forwards to unmanaged wrappers -------------------------------
 bool Socksifier::Socksifier::IncludeProcessDestinationCidr(String^ processName, String^ cidr)
 {
     if (!unmanaged_ptr_) return false;
@@ -353,4 +416,3 @@ bool Socksifier::Socksifier::RemoveProcessDestinationCidr(String^ processName, S
         msclr::interop::marshal_as<std::wstring>(processName),
         msclr::interop::marshal_as<std::string>(cidr));
 }
-// ---------------------------------------------------------------------------

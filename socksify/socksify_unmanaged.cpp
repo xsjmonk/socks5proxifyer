@@ -1,13 +1,5 @@
 #include "unmanaged.h"
-
-// Bring in the small destination-inclusion policy C-API (added feature)
 #include "policy/dest_inclusion_policy.h"
-
-#include <cwctype>   // for towlower
-#include <string>
-
-// Force this TU to be compiled as native even if project defaults change
-#pragma managed(push, off)
 
 /**
  * @brief Platform-specific mutex implementation for thread safety.
@@ -18,34 +10,16 @@ struct mutex_impl
 };
 
 /**
- * @brief Helper to normalize process names to policy keys:
- * - take only filename
- * - drop trailing extension (e.g., .exe)
- * - lowercase
- */
-static std::wstring normalize_process_key(std::wstring s)
-{
-    // 1) strip any path
-    if (const auto pos = s.find_last_of(L"\\/"); pos != std::wstring::npos)
-        s = s.substr(pos + 1);
-
-    // 2) drop extension if present
-    if (const auto dot = s.find_last_of(L'.'); dot != std::wstring::npos)
-        s = s.substr(0, dot);
-
-    // 3) lowercase
-    for (auto& ch : s) ch = static_cast<wchar_t>(std::towlower(ch));
-
-    return s;
-}
-
-/**
  * @brief Constructs the socksify_unmanaged singleton instance.
  * Initializes Winsock, logging, and the SOCKS5 local router.
  * @param log_level The logging level to use for the proxy gateway.
+ * @param bypass_unresolved_processes Whether unresolved process owners must remain direct.
+ * @throws std::runtime_error if WSAStartup or pcap log file creation fails.
  */
-socksify_unmanaged::socksify_unmanaged(const log_level_mx log_level) :
-    log_level_{ log_level }
+socksify_unmanaged::socksify_unmanaged(const log_level_mx log_level,
+    const bool bypass_unresolved_processes) :
+    log_level_{ log_level },
+    bypass_unresolved_processes_{ bypass_unresolved_processes }
 {
     using namespace std::string_literals;
 
@@ -122,24 +96,29 @@ socksify_unmanaged::socksify_unmanaged(const log_level_mx log_level) :
 
     print_log(log_level_mx::info, "Creating SOCKS5 Local Router instance..."s);
 
-    // Map our mixed log level to netlib level (no verbosity tuning calls)
     auto um_log_level = netlib::log::log_level::all;
+
     switch (log_level_)
     {
     case log_level_mx::error:
         um_log_level = netlib::log::log_level::error;
+        set_global_log_verbosity(netlib::log::log_verbosity::level);
         break;
     case log_level_mx::warning:
         um_log_level = netlib::log::log_level::warning;
+        set_global_log_verbosity(netlib::log::log_verbosity::level);
         break;
     case log_level_mx::info:
         um_log_level = netlib::log::log_level::info;
+        set_global_log_verbosity(netlib::log::log_verbosity::logger | netlib::log::log_verbosity::level);
         break;
     case log_level_mx::deb:
         um_log_level = netlib::log::log_level::debug;
+        set_global_log_verbosity(netlib::log::log_verbosity::thread | netlib::log::log_verbosity::path | netlib::log::log_verbosity::level);
         break;
     case log_level_mx::all:
         um_log_level = netlib::log::log_level::all;
+        set_global_log_verbosity(netlib::log::log_verbosity::all);
         break;
     }
 
@@ -155,7 +134,11 @@ socksify_unmanaged::socksify_unmanaged(const log_level_mx log_level) :
     proxy_ = std::make_unique<proxy::socks_local_router>(
         um_log_level,
         logger::get_instance()->get_log_stream(),
-        /*pcap*/ nullptr
+        pcap_log_file_ ?
+        std::shared_ptr<std::ostream>(&pcap_log_file_.value(), [](std::ostream*) {
+            // No-op deleter - the stream is owned by the optional member variable
+            }) : nullptr,
+        bypass_unresolved_processes
     );
 
     if (!proxy_)
@@ -164,14 +147,14 @@ socksify_unmanaged::socksify_unmanaged(const log_level_mx log_level) :
         throw std::runtime_error("Failed to create the SOCKS5 Local Router instance!");
     }
 
-    // Wire destination-policy decider (optional gate).
-    // Normalizes process name to match policy keys added from Program.cs (e.g., "rdcman", "mstsc").
-    proxy_->set_redirect_decider([](const std::wstring& proc,
-                                    const sockaddr* sa,
-                                    int salen) -> bool
+    proxy_->set_redirect_decider([](const std::wstring& process_name,
+                                    const sockaddr* destination,
+                                    const int destination_length)
     {
-        const std::wstring key = normalize_process_key(proc);
-        return dip_should_redirect_for(key.c_str(), sa, salen) == 1;
+        return dip_should_redirect_for(
+            process_name.c_str(),
+            destination,
+            destination_length) == 1;
     });
 
     print_log(log_level_mx::info, "SOCKS5 Local Router instance successfully created."s);
@@ -192,11 +175,16 @@ socksify_unmanaged::~socksify_unmanaged()
 /**
  * @brief Gets the singleton instance of socksify_unmanaged.
  * @param log_level The logging level to use (default: log_level_mx::all).
+ * @param bypass_unresolved_processes Whether unresolved process owners must remain direct.
  * @return Pointer to the singleton instance.
  */
-socksify_unmanaged* socksify_unmanaged::get_instance(const log_level_mx log_level)
+socksify_unmanaged* socksify_unmanaged::get_instance(const log_level_mx log_level,
+    const bool bypass_unresolved_processes)
 {
-    static socksify_unmanaged inst(log_level); // NOLINT(clang-diagnostic-exit-time-destructors)
+    static socksify_unmanaged inst(log_level, bypass_unresolved_processes); // NOLINT(clang-diagnostic-exit-time-destructors)
+    if (inst.bypass_unresolved_processes_ != bypass_unresolved_processes)
+        throw std::logic_error(
+            "The unmanaged Socksifier singleton is already initialized with a different unresolved-owner policy.");
     return &inst;
 }
 
@@ -387,6 +375,9 @@ LONG_PTR socksify_unmanaged::add_socks5_proxy(
 
 /**
  * @brief Associates a process name with a specific proxy.
+ * @param process_name The process name to associate.
+ * @param proxy_id The handle of the proxy to associate with.
+ * @return True if association was successful, false otherwise.
  */
 bool socksify_unmanaged::associate_process_name_to_proxy(const std::wstring& process_name,
     const LONG_PTR proxy_id) const
@@ -396,15 +387,33 @@ bool socksify_unmanaged::associate_process_name_to_proxy(const std::wstring& pro
 
 /**
  * @brief Associates a process name to the exclusion list.
+ * @param process_name The process name to associate.
+ * @return True if addition was successful, false otherwise.
  */
 bool socksify_unmanaged::exclude_process_name(const std::wstring& process_name) const
 {
     return proxy_->exclude_process_name(process_name);
 }
 
+bool socksify_unmanaged::include_process_dst_cidr(
+    const std::wstring& process_name,
+    const std::string& cidr) const
+{
+    return dip_add_process(process_name.c_str(), cidr.c_str()) == 1;
+}
+
+bool socksify_unmanaged::remove_process_dst_cidr(
+    const std::wstring& process_name,
+    const std::string& cidr) const
+{
+    return dip_remove_process(process_name.c_str(), cidr.c_str()) == 1;
+}
+
 /**
  * @brief Sets the maximum number of log entries to keep.
+ * @param log_limit The new log limit.
  */
+ // ReSharper disable once CppMemberFunctionMayBeStatic
 void socksify_unmanaged::set_log_limit(const uint32_t log_limit)
 {
     logger::get_instance()->set_log_limit(log_limit);
@@ -412,7 +421,9 @@ void socksify_unmanaged::set_log_limit(const uint32_t log_limit)
 
 /**
  * @brief Gets the current log limit.
+ * @return The log limit.
  */
+ // ReSharper disable once CppMemberFunctionMayBeStatic
 uint32_t socksify_unmanaged::get_log_limit()
 {
     return logger::get_instance()->get_log_limit();
@@ -420,7 +431,9 @@ uint32_t socksify_unmanaged::get_log_limit()
 
 /**
  * @brief Sets the event handle to signal when log limit is exceeded.
+ * @param log_event The Windows event handle.
  */
+ // ReSharper disable once CppMemberFunctionMayBeStatic
 void socksify_unmanaged::set_log_event(HANDLE log_event)
 {
     logger::get_instance()->set_log_event(log_event);
@@ -428,7 +441,9 @@ void socksify_unmanaged::set_log_event(HANDLE log_event)
 
 /**
  * @brief Reads and clears the log storage.
+ * @return The log storage as a log_storage_mx_t object.
  */
+ // ReSharper disable once CppMemberFunctionMayBeStatic
 log_storage_mx_t socksify_unmanaged::read_log()
 {
     return logger::get_instance()->read_log().value_or(log_storage_mx_t{});
@@ -436,6 +451,7 @@ log_storage_mx_t socksify_unmanaged::read_log()
 
 /**
  * @brief Static helper for printing log messages.
+ * @param log The message to log.
  */
 void socksify_unmanaged::log_printer(const char* log)
 {
@@ -444,6 +460,7 @@ void socksify_unmanaged::log_printer(const char* log)
 
 /**
  * @brief Static helper for logging events.
+ * @param log The event to log.
  */
 void socksify_unmanaged::log_event(const event_mx log)
 {
@@ -452,6 +469,8 @@ void socksify_unmanaged::log_event(const event_mx log)
 
 /**
  * @brief Prints a log message at the specified log level.
+ * @param level The log level.
+ * @param message The message to print.
  */
 void socksify_unmanaged::print_log(const log_level_mx level, const std::string& message) const
 {
@@ -486,19 +505,3 @@ void socksify_unmanaged::print_log(const log_level_mx level, const std::string& 
         log_printer(tagged_message.c_str());
     }
 }
-
-// ---------- per-process CIDR policy forwards ----------
-bool socksify_unmanaged::include_process_dst_cidr(const std::wstring& process_name,
-                                                  const std::string& cidr) const
-{
-    return dip_add_process(process_name.c_str(), cidr.c_str()) == 1;
-}
-
-bool socksify_unmanaged::remove_process_dst_cidr(const std::wstring& process_name,
-                                                 const std::string& cidr) const
-{
-    return dip_remove_process(process_name.c_str(), cidr.c_str()) == 1;
-}
-// -----------------------------------------------------
-
-#pragma managed(pop)
