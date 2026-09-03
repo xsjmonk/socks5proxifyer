@@ -1,0 +1,19 @@
+---
+description: Always preserve ProxiFyre UI, configuration bootstrap, native routing, and modular ownership during merges.
+alwaysApply: true
+---
+
+# Merge and Regression Guardrails
+
+- Keep `ProxiFyre/Program.cs` as the WinForms entry point and launch `MainForm`.
+- Keep `ProxiFyreService` in `ProxiFyre/ProxiFyreService.cs`; it loads executable-relative `app-config.json`, `NLog.config`, proxies, exclusions, LAN bypass, and CIDR rules.
+- Include each source file exactly once in the project file. Never create duplicate `Program`, `ProxiFyreService`, or entry-point implementations.
+- Resolve conflicts by module ownership and parent comparison; never blindly select ours/theirs for a large file.
+- Keep UI, configuration, managed/native boundary, native router, policy, and tests in separate modules.
+- Validate `AddSocks5Proxy` handles before association or policy calls. Fix the first proxy-creation failure instead of reporting index errors.
+- Treat optional upstream PASS-filter rejection as non-fatal, preserving the established proxy-port fallback.
+- After a merge, search for markers, duplicate types, stale project includes, dead startup paths, placeholders, and generated artifacts.
+- Build the affected project and solution, and perform an executable/UI smoke check when possible.
+- Do not claim completion when runtime behavior, configuration loading, or driver-dependent behavior remains unverified.
+
+For the full workflow and trap list, read `.cursor/skills/merge-maintenance/SKILL.md`.
