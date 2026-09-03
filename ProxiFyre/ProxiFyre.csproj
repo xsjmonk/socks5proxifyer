@@ -119,6 +119,7 @@
     </Compile>
     <Compile Include="ConsoleTextWriter.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="ProxiFyreService.cs" />
   </ItemGroup>
   <PropertyGroup>
     <DefineConstants>$(DefineConstants);PROXIFYRE_ENGINE</DefineConstants>

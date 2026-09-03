@@ -12,7 +12,6 @@ using ProxiFyre.Configuration;
 using Socksifier;
 using System.Runtime.CompilerServices;
 using System.Security.Principal;
-using System.Text;
 using Topshelf;
 
 // Disambiguate between NLog.LogLevel and Socksifier.LogLevel.
@@ -20,8 +19,30 @@ using LogLevel = Socksifier.LogLevel;
 
 namespace ProxiFyre
 {
-    public class ProxiFyreService
+    internal class Program
     {
+        [STAThread]
+        private static void Main()
+        {
+            System.Windows.Forms.Application.EnableVisualStyles();
+            System.Windows.Forms.Application.SetCompatibleTextRenderingDefault(false);
+
+            var service = new ProxiFyreService();
+            var form = new MainForm(service);
+
+            var originalOut = Console.Out;
+            var originalErr = Console.Error;
+            var uiWriter = new TextBoxTextWriter(form.AppendLogSafe);
+
+            Console.SetOut(new MultiTextWriter(originalOut, uiWriter));
+            Console.SetError(new MultiTextWriter(originalErr, uiWriter));
+
+            System.Windows.Forms.Application.Run(form);
+
+            try { service.Stop(); } catch { }
+            try { Console.SetOut(originalOut); } catch { }
+            try { Console.SetError(originalErr); } catch { }
+        }
         /// <summary>
         /// NLog logger instance for logging service events.
         /// </summary>
@@ -36,21 +57,6 @@ namespace ProxiFyre
         /// The Socksifier instance used to manage SOCKS5 proxies.
         /// </summary>
         private Socksifier.Socksifier _socksify;
-
-        /// <summary>
-        /// When true, traffic whose owning process cannot be resolved is deliberately
-        /// kept direct instead of being eligible for a catch-all proxy rule.
-        /// </summary>
-        private readonly bool _useLimitedMode;
-
-        public ProxiFyreService() : this(false)
-        {
-        }
-
-        internal ProxiFyreService(bool useLimitedMode)
-        {
-            _useLimitedMode = useLimitedMode;
-        }
 
         /// <summary>
         /// Starts the ProxiFyre service, loads configuration, and initializes proxies.
@@ -71,12 +77,6 @@ namespace ProxiFyre
             if (File.Exists(logConfigFilePath))
                 LogManager.Configuration = new XmlLoggingConfiguration(logConfigFilePath);
 
-            // Emit this before applying the configured minimum level so the safety warning is
-            // retained even when app-config.json selects Error logging. The command-line path
-            // also writes it to stderr for launchers that capture console output.
-            if (_useLimitedMode)
-                LoggerInstance.Warn(Program.LimitedModeWarning);
-
             // Load and validate the configuration from JSON
             var serviceSettings = LoadConfiguration(configFilePath);
 
@@ -89,16 +89,13 @@ namespace ProxiFyre
             // actionable engine log instead of only an SCM startup failure.
             try
             {
-                _socksify = Socksifier.Socksifier.GetInstance(_logLevel, _useLimitedMode);
+                _socksify = Socksifier.Socksifier.GetInstance(_logLevel);
             }
             catch (Exception ex)
             {
-                var message = _useLimitedMode
-                    ? "Failed to initialize the ProxiFyre proxy engine in non-administrator mode. " +
-                      "Ensure the Windows Packet Filter (NDISRD) driver is installed and that this " +
-                      "Windows account is permitted to open the driver, then retry."
-                    : "Failed to initialize the ProxiFyre proxy engine. Ensure the Windows Packet Filter " +
-                      "(NDISRD) driver is installed and available, then restart the service.";
+                const string message =
+                    "Failed to initialize the ProxiFyre proxy engine. Ensure the Windows Packet Filter " +
+                    "(NDISRD) driver is installed and available, then restart the service.";
                 LoggerInstance.Error(ex, message);
                 throw new InvalidOperationException(message, ex);
             }
@@ -175,13 +172,9 @@ namespace ProxiFyre
             // Topshelf fails the start and the SCM reports the failure.
             if (!_socksify.Start())
             {
-                var message = _useLimitedMode
-                    ? "Failed to start the ProxiFyre proxy engine in non-administrator mode. " +
-                      "Ensure the Windows Packet Filter (NDISRD) driver is installed and running and " +
-                      "that this Windows account is permitted to activate it, or retry from an " +
-                      "Administrator console."
-                    : "Failed to start the ProxiFyre proxy engine. Ensure the Windows Packet Filter " +
-                      "(NDIS lightweight filter) driver is installed and running, then restart the service.";
+                const string message =
+                    "Failed to start the ProxiFyre proxy engine. Ensure the Windows Packet Filter " +
+                    "(NDIS lightweight filter) driver is installed and running, then restart the service.";
                 LoggerInstance.Error(message);
                 throw new InvalidOperationException(message);
             }
@@ -361,15 +354,8 @@ namespace ProxiFyre
     /// <summary>
     /// Entry point for the ProxiFyre service application.
     /// </summary>
-    internal class Program
+    internal class ServiceProgram
     {
-        internal const string LimitedModeWarning =
-            "WARNING: ProxiFyre is running in explicitly enabled non-administrator mode. " +
-            "Driver access and process attribution are best effort. Traffic whose owner cannot be " +
-            "resolved (which may include protected, elevated, system, or other-user traffic) remains direct. " +
-            "This mode is not a strict current-user security boundary and must not be used for complete " +
-            "machine-wide enforcement.";
-
         private static bool IsElevated()
         {
             try
@@ -392,10 +378,8 @@ namespace ProxiFyre
         /// <returns>The Topshelf exit code as an integer.</returns>
         // Keep service dispatch separate from the WinForms entry point so
         // this project retains the legacy UI as its only startup path.
-        private static int Main(string[] args)
+        private static int RunService(string[] args)
         {
-            args = args ?? Array.Empty<string>();
-
             try
             {
                 NativeDependencyLoader.Initialize();
@@ -408,19 +392,8 @@ namespace ProxiFyre
                 return 126; // ERROR_MOD_NOT_FOUND
             }
 
-            var commandLine = EngineCommandLinePolicy.Evaluate(
-                args, Environment.UserInteractive, IsElevated());
-
-            if (!commandLine.CanRun)
-            {
-                Console.Error.WriteLine(GetCommandLineDenialMessage(commandLine.Denial));
-                return commandLine.Denial == EngineCommandLineDenial.AdministratorPrivilegesRequired
-                    ? 5 // ERROR_ACCESS_DENIED
-                    : 87; // ERROR_INVALID_PARAMETER
-            }
-
 #if !DEBUG
-            if (commandLine.RequiresProtectedServiceLocation)
+            if (RequiresProtectedServiceLocation(args))
             {
                 string locationFailure;
                 if (!EngineServiceInstallLocationPolicy.IsProtected(
@@ -439,34 +412,22 @@ namespace ProxiFyre
             // Keep all references that can cause the mixed-mode Socksifier assembly to load
             // behind a non-inlined boundary. The CLR must execute the loader policy above before
             // it can JIT this method or resolve ProxiFyreService.
-            return RunAfterNativeDependencyPolicy(args, commandLine);
+            return RunAfterNativeDependencyPolicy(args);
         }
 
-        private static string GetCommandLineDenialMessage(EngineCommandLineDenial denial)
+#if !DEBUG
+        private static bool RequiresProtectedServiceLocation(string[] args)
         {
-            switch (denial)
-            {
-                case EngineCommandLineDenial.ConflictingOperationalCommands:
-                    return "ProxiFyre received more than one operational command. Specify only one " +
-                           "of run, install, uninstall, start, stop, or command.";
-                case EngineCommandLineDenial.AllowNotAdministratorWithServiceControlCommand:
-                    return "--allow-not-admin is available only for an interactive console run; " +
-                           "it cannot be combined with service-control commands: install, " +
-                           "uninstall, start, stop, or command.";
-                case EngineCommandLineDenial.AllowNotAdministratorRequiresInteractiveSession:
-                    return "--allow-not-admin cannot be used by the Windows service or another " +
-                           "non-interactive session. Run ProxiFyre interactively instead.";
-                default:
-                    return "ProxiFyre must run with administrator privileges so process ownership, " +
-                           "application exclusions, and packet redirection remain reliable. Start it from " +
-                           "an Administrator console, install and start the Windows service, or explicitly " +
-                           "opt into the limited interactive mode with --allow-not-admin.";
-            }
+            var command = args != null && args.Length > 0
+                ? (args[0] ?? string.Empty).Trim().ToLowerInvariant()
+                : string.Empty;
+            return command == "install" || command == "start" ||
+                   !Environment.UserInteractive;
         }
+#endif
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        private static int RunAfterNativeDependencyPolicy(string[] arguments,
-            EngineCommandLineDecision commandLine)
+        private static int RunAfterNativeDependencyPolicy(string[] args)
         {
             // Detect Topshelf lifecycle commands. For these commands the underlying
             // .NET installer (System.Configuration.Install.InstallContext, invoked via
@@ -474,11 +435,28 @@ namespace ProxiFyre
             // lines to Console.Out with noticeable delays between them, which can lead
             // users to close the console before the operation has actually completed.
             // We capture that output and replace it with a single, unambiguous message.
-            var command = commandLine.LifecycleCommand;
-            var isLifecycleCommand = commandLine.IsLifecycleCommand;
+            var command = args.Length > 0 && !string.IsNullOrEmpty(args[0])
+                ? args[0].ToLowerInvariant()
+                : null;
 
-            if (commandLine.UseLimitedMode)
-                Console.Error.WriteLine(LimitedModeWarning);
+            var isLifecycleCommand = command == "install"
+                                     || command == "uninstall"
+                                     || command == "start"
+                                     || command == "stop";
+
+            var isHelpCommand = command == "help"
+                                || command == "--help"
+                                || command == "-h"
+                                || command == "/?";
+
+            if (!isLifecycleCommand && !isHelpCommand && !IsElevated())
+            {
+                Console.Error.WriteLine(
+                    "ProxiFyre must run with administrator privileges so process ownership, " +
+                    "application exclusions, and packet redirection remain reliable. Start it from " +
+                    "an Administrator console or install and start the Windows service.");
+                return 5; // ERROR_ACCESS_DENIED
+            }
 
             var originalOut = Console.Out;
             var originalError = Console.Error;
@@ -498,7 +476,7 @@ namespace ProxiFyre
                     {
                         x.Service<ProxiFyreService>(s =>
                         {
-                            s.ConstructUsing(name => new ProxiFyreService(commandLine.UseLimitedMode));
+                            s.ConstructUsing(name => new ProxiFyreService());
                             s.WhenStarted(tc => tc.Start());
                             s.WhenStopped(tc => tc.Stop());
                         });
@@ -509,15 +487,6 @@ namespace ProxiFyre
                         x.SetDisplayName("ProxiFyre Service");
                         x.SetServiceName(ProxiFyrePaths.ServiceName);
                         x.DependsOn(ProxiFyrePaths.WindowsPacketFilterServiceName);
-
-                        if (commandLine.AllowNotAdministratorRequested)
-                        {
-                            // Topshelf 4.3 splits hyphenated switch names into separate tokens.
-                            // ProxiFyre owns this exact opt-in, so remove only that token and ask
-                            // Topshelf to parse every remaining argument explicitly. Calling this
-                            // overload also prevents HostFactory from reparsing Environment.CommandLine.
-                            x.ApplyCommandLine(BuildTopshelfCommandLine(arguments));
-                        }
                     });
                 }
                 finally
@@ -567,52 +536,6 @@ namespace ProxiFyre
 
                 return (int)exitCode;
             }
-        }
-
-        private static string BuildTopshelfCommandLine(string[] arguments)
-        {
-            return string.Join(" ", arguments
-                .Where(argument => !string.Equals(argument,
-                    EngineCommandLinePolicy.AllowNotAdministratorSwitch,
-                    StringComparison.Ordinal))
-                .Select(QuoteCommandLineArgument));
-        }
-
-        private static string QuoteCommandLineArgument(string argument)
-        {
-            argument = argument ?? string.Empty;
-            if (argument.Length > 0 && argument.IndexOf('"') < 0 && !argument.Any(char.IsWhiteSpace))
-                return argument;
-
-            // Preserve the standard Windows command-line quoting rules so Topshelf receives the
-            // same argument values that Main did, including embedded quotes and trailing slashes.
-            var result = new StringBuilder(argument.Length + 2);
-            result.Append('"');
-            var backslashes = 0;
-            foreach (var character in argument)
-            {
-                if (character == '\\')
-                {
-                    backslashes++;
-                    continue;
-                }
-
-                if (character == '"')
-                {
-                    result.Append('\\', backslashes * 2 + 1);
-                    result.Append('"');
-                    backslashes = 0;
-                    continue;
-                }
-
-                result.Append('\\', backslashes);
-                backslashes = 0;
-                result.Append(character);
-            }
-
-            result.Append('\\', backslashes * 2);
-            result.Append('"');
-            return result.ToString();
         }
     }
 }

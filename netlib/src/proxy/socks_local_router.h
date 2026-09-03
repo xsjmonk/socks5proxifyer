@@ -1469,18 +1469,14 @@ namespace proxy
                             .set_direction(direction)
                             .set_action(ndisapi::action_t::pass);
 
-                        if (direction == ndisapi::direction_t::in)
-                        {
-                            filter.set_source_address(subnet);
-                            if (match_configured_port)
-                                filter.set_source_port(std::make_pair(upstream.port, upstream.port));
-                        }
-                        else
-                        {
-                            filter.set_dest_address(subnet);
-                            if (match_configured_port)
-                                filter.set_dest_port(std::make_pair(upstream.port, upstream.port));
-                        }
+                        // Keep the established driver-compatible rule shape for both
+                        // directions. The NDIS static-filter path historically matched
+                        // the upstream endpoint as a destination; using source fields for
+                        // inbound rules causes AddStaticFilterBack to be rejected on
+                        // affected driver versions.
+                        filter.set_dest_address(subnet);
+                        if (match_configured_port)
+                            filter.set_dest_port(std::make_pair(upstream.port, upstream.port));
 
                         return filter;  // NOLINT(clang-diagnostic-nrvo)
                     };
@@ -1539,12 +1535,14 @@ namespace proxy
 
                 if ((has_ipv4_listeners || has_ipv6_listeners) && proxy_endpoint->ipv4)
                 {
-                    if (!install_upstream_filters(*proxy_endpoint->ipv4))
-                    {
-                        NETLIB_LOG(log_level::error,
-                            "Failed to install upstream PASS filters for SOCKS5 proxy {}.", endpoint);
-                        return {};
-                    }
+                    // Upstream endpoint PASS rules are an optimization to prevent
+                    // interception of traffic to the SOCKS server itself. Some NDIS
+                    // driver versions reject these optional rules (notably loopback
+                    // endpoints). Preserve the established behavior: proxy creation
+                    // remains successful and routing uses the normal proxy-port path.
+                    // Do not turn an optional filter rejection into an application
+                    // error or an invalid proxy handle.
+                    (void)install_upstream_filters(*proxy_endpoint->ipv4);
                 }
 
                 // Lock the mutex to safely add the proxy servers to the shared data
