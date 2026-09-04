@@ -65,6 +65,8 @@ app-config.json
 
 # --- Build output trees not covered by the extension rules above ---
 /bin/
+/Build/
+/Build.staging/
 socksify/x64/
 socksify/Win32/
 socksify/ARM64/

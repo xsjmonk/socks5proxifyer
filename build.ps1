@@ -112,6 +112,34 @@ function Remove-IfExists {
     }
 }
 
+function Assert-DirectoryCanBeReplaced {
+    param([string]$DirectoryPath)
+
+    if (-not (Test-Path -LiteralPath $DirectoryPath)) {
+        return
+    }
+
+    $probePath = "$DirectoryPath.publish-probe-$([guid]::NewGuid().ToString('N'))"
+    try {
+        # A successful rename proves that no running application, antivirus
+        # scanner, or other process is holding the artifact tree open. Restore
+        # the original name immediately; publication happens only after the
+        # complete staged artifact set has been built.
+        Move-Item -LiteralPath $DirectoryPath -Destination $probePath -ErrorAction Stop
+        Move-Item -LiteralPath $probePath -Destination $DirectoryPath -ErrorAction Stop
+    }
+    catch {
+        if ((Test-Path -LiteralPath $probePath) -and
+            -not (Test-Path -LiteralPath $DirectoryPath)) {
+            try {
+                Move-Item -LiteralPath $probePath -Destination $DirectoryPath -ErrorAction SilentlyContinue
+            } catch { }
+        }
+
+        throw "Cannot replace '$DirectoryPath'. Stop the running application or release the folder lock, then rerun the build. No deployable artifact set was published. $($_.Exception.Message)"
+    }
+}
+
 function Get-SolutionProjectDirectories {
     param([string]$SolutionPath)
 
@@ -138,10 +166,13 @@ function Get-SolutionProjectDirectories {
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $solution = Join-Path $root "socksify.sln"
 $buildDir = Join-Path $root "Build"
+$stagingDir = Join-Path $root "Build.staging"
 
 if (-not (Test-Path $solution)) {
     throw "Solution file not found: $solution"
 }
+
+Assert-DirectoryCanBeReplaced -DirectoryPath $buildDir
 
 $msbuild = Get-MSBuildPath
 Write-Info "Using MSBuild: $msbuild"
@@ -151,13 +182,13 @@ Invoke-Restore -MSBuildPath $msbuild -SolutionPath $solution
 Invoke-Build -MSBuildPath $msbuild -SolutionPath $solution -ConfigurationName $Configuration -PlatformName $Platform
 
 Write-Info "Refreshing Build folder"
-Remove-IfExists $buildDir
-New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+Remove-IfExists $stagingDir
+New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
 
 $outputRoots = @(
-    @{ Source = (Join-Path $root "bin\lib\$Platform\$Configuration"); Destination = (Join-Path $buildDir "lib") }
-    @{ Source = (Join-Path $root "bin\dll\$Platform\$Configuration"); Destination = (Join-Path $buildDir "dll") }
-    @{ Source = (Join-Path $root "bin\exe\$Platform\$Configuration"); Destination = (Join-Path $buildDir "exe") }
+    @{ Source = (Join-Path $root "bin\lib\$Platform\$Configuration"); Destination = (Join-Path $stagingDir "lib") }
+    @{ Source = (Join-Path $root "bin\dll\$Platform\$Configuration"); Destination = (Join-Path $stagingDir "dll") }
+    @{ Source = (Join-Path $root "bin\exe\$Platform\$Configuration"); Destination = (Join-Path $stagingDir "exe") }
 )
 
 foreach ($entry in $outputRoots) {
@@ -178,7 +209,11 @@ foreach ($target in ($cleanupTargets | Select-Object -Unique)) {
 }
 
 Write-Info "Deleting PDB and EXP files from Build folder"
-Get-ChildItem -Path $buildDir -Include *.pdb,*.exp -Recurse -File | Remove-Item -Force
+Get-ChildItem -Path $stagingDir -Include *.pdb,*.exp -Recurse -File | Remove-Item -Force
+
+Write-Info "Publishing complete artifact set"
+Remove-IfExists $buildDir
+Move-Item -LiteralPath $stagingDir -Destination $buildDir
 
 Write-Info "Build completed successfully"
 Write-Info "Artifacts: $buildDir"

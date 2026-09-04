@@ -1288,10 +1288,44 @@ namespace proxy
             // proxy_servers_ has already missed) or with stop().
             std::scoped_lock lifecycle_lock(lifecycle_mutex_);
 
-            // NOTE: the static PASS filters for the upstream endpoint are installed only AFTER
-            // the proxy pair is successfully built and (optionally) started -- see below, just
-            // before proxy_servers_ is updated. Installing them here (before build/start) leaked
-            // orphaned driver filters on every failure path.
+            // Preserve the working merge_0830 ordering. These upstream PASS
+            // filters are optional and their driver result must not determine
+            // whether the proxy is registered.
+            const auto create_filter = [](const uint8_t protocol,
+                                          const ndisapi::direction_t direction,
+                                          const net::ip_address_v4& address,
+                                          const uint16_t port)
+            {
+                ndisapi::filter<net::ip_address_v4> filter;
+                filter.set_protocol(protocol)
+                    .set_direction(direction)
+                    .set_action(ndisapi::action_t::pass)
+                    .set_dest_address(net::ip_subnet{ address, net::ip_address_v4{"255.255.255.255"} })
+                    .set_dest_port(std::make_pair(port, port));
+                return filter;
+            };
+
+            const auto tcp_out_filter = create_filter(
+                IPPROTO_TCP, ndisapi::direction_t::out, proxy_endpoint->ipv4->ip, proxy_endpoint->ipv4->port);
+            const auto tcp_in_filter = create_filter(
+                IPPROTO_TCP, ndisapi::direction_t::in, proxy_endpoint->ipv4->ip, proxy_endpoint->ipv4->port);
+            const auto udp_out_filter = create_filter(
+                IPPROTO_UDP, ndisapi::direction_t::out, proxy_endpoint->ipv4->ip, proxy_endpoint->ipv4->port);
+            const auto udp_in_filter = create_filter(
+                IPPROTO_UDP, ndisapi::direction_t::in, proxy_endpoint->ipv4->ip, proxy_endpoint->ipv4->port);
+
+            if (protocols == both || protocols == udp)
+            {
+                std::ignore = static_filters_.add_filter_back(tcp_out_filter);
+                std::ignore = static_filters_.add_filter_back(tcp_in_filter);
+                std::ignore = static_filters_.add_filter_back(udp_out_filter);
+                std::ignore = static_filters_.add_filter_back(udp_in_filter);
+            }
+            else if (protocols == tcp)
+            {
+                std::ignore = static_filters_.add_filter_back(tcp_out_filter);
+                std::ignore = static_filters_.add_filter_back(tcp_in_filter);
+            }
 
             try
             {
@@ -1442,107 +1476,6 @@ namespace proxy
                     proxy_servers_v6_.reserve(proxy_servers_v6_.size() + 1);
                     proxy_protocols_.reserve(proxy_protocols_.size() + 1);
                     proxy_address_families_.reserve(proxy_address_families_.size() + 1);
-                }
-
-                // Install PASS filters only for upstream addresses selected by
-                // listeners that survived construction/start. Inbound filters match
-                // the proxy as the packet source; outbound filters match it as the
-                // destination.
-                const auto install_upstream_filters = [this, protocols](const auto& upstream) -> bool  // NOLINT(clang-diagnostic-padded)
-                {
-                    using address_t = std::remove_cvref_t<decltype(upstream.ip)>;
-                    const auto mask = []
-                    {
-                        if constexpr (std::is_same_v<address_t, net::ip_address_v4>)
-                            return net::ip_address_v4{ "255.255.255.255" };
-                        else
-                            return net::ip_address_v6{ "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff" };
-                    }();
-                    const net::ip_subnet<address_t> subnet{ upstream.ip, mask };
-
-                    const auto create_filter = [&subnet, &upstream](const uint8_t protocol,
-                                                                    const ndisapi::direction_t direction,
-                                                                    const bool match_configured_port)
-                    {
-                        ndisapi::filter<address_t> filter;
-                        filter.set_protocol(protocol)
-                            .set_direction(direction)
-                            .set_action(ndisapi::action_t::pass);
-
-                        // Keep the established driver-compatible rule shape for both
-                        // directions. The NDIS static-filter path historically matched
-                        // the upstream endpoint as a destination; using source fields for
-                        // inbound rules causes AddStaticFilterBack to be rejected on
-                        // affected driver versions.
-                        filter.set_dest_address(subnet);
-                        if (match_configured_port)
-                            filter.set_dest_port(std::make_pair(upstream.port, upstream.port));
-
-                        return filter;  // NOLINT(clang-diagnostic-nrvo)
-                    };
-
-                    const auto first_filter_position = static_filters_.size();
-                    const auto rollback = [this, first_filter_position]
-                    {
-                        while (static_filters_.size() > first_filter_position)
-                        {
-                            if (!static_filters_.remove_filter(static_cast<uint32_t>(first_filter_position)))
-                            {
-                                NETLIB_LOG(log_level::error,
-                                    "Failed to roll back an upstream PASS filter at position {}.",
-                                    first_filter_position);
-                                break;
-                            }
-                        }
-                    };
-
-                    try
-                    {
-                        const auto add_filter = [this, &rollback](const auto& filter)
-                        {
-                            if (static_filters_.add_filter_back(filter))
-                                return true;
-
-                            rollback();
-                            return false;
-                        };
-
-                        if (!add_filter(create_filter(IPPROTO_TCP, ndisapi::direction_t::out, true)) ||
-                            !add_filter(create_filter(IPPROTO_TCP, ndisapi::direction_t::in, true)))
-                            return false;
-
-                        if (protocol_supports_udp(protocols))
-                        {
-                            // UDP ASSOCIATE may return a relay port unrelated to the
-                            // configured SOCKS5 port. Exempt the proxy host's UDP traffic
-                            // by address so relay packets cannot be captured recursively.
-                            if (!add_filter(create_filter(IPPROTO_UDP, ndisapi::direction_t::out, false)) ||
-                                !add_filter(create_filter(IPPROTO_UDP, ndisapi::direction_t::in, false)))
-                                return false;
-                        }
-
-                        return true;
-                    }
-                    catch (...)
-                    {
-                        rollback();
-                        throw;
-                    }
-                };
-
-                const bool has_ipv4_listeners = socks_tcp_proxy_server || socks_udp_proxy_server;
-                const bool has_ipv6_listeners = socks_tcp_proxy_server_v6 || socks_udp_proxy_server_v6;
-
-                if ((has_ipv4_listeners || has_ipv6_listeners) && proxy_endpoint->ipv4)
-                {
-                    // Upstream endpoint PASS rules are an optimization to prevent
-                    // interception of traffic to the SOCKS server itself. Some NDIS
-                    // driver versions reject these optional rules (notably loopback
-                    // endpoints). Preserve the established behavior: proxy creation
-                    // remains successful and routing uses the normal proxy-port path.
-                    // Do not turn an optional filter rejection into an application
-                    // error or an invalid proxy handle.
-                    (void)install_upstream_filters(*proxy_endpoint->ipv4);
                 }
 
                 // Lock the mutex to safely add the proxy servers to the shared data
