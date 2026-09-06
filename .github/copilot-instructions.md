@@ -2,7 +2,16 @@
 
 ProxiFyre is a Windows-specific SOCKS5 proxifier application that builds upon the Windows Packet Filter's socksify demo. The solution has 11 build projects: the packet-filter library, C++/CLI bridge, service engine, shared configuration library, managed UI, native UI launcher, managed tests, MSI, Burn bundle, and two native setup helpers. ProxiFyre.Tests covers managed logic without requiring the driver or a live service.
 
-**ALWAYS reference these instructions first and fallback to search or bash commands only when you encounter unexpected information that does not match the info here.**
+For any merge, rebase, cherry-pick, conflict repair, or upstream integration,
+automatically apply `.cursor/rules/merge-maintenance.mdc` and `AGENTS.md`.
+Those files are the primary agent-neutral merge policy; this document provides
+repository-specific build context and does not require a special command.
+
+The repository has two UI surfaces: `ProxiFyre` is the engine-hosting WinForms
+surface and owns `ProxiFyreService` networking bootstrap; `ProxiFyreUI` plus
+`ProxiFyreUILauncher` is the configuration/service-management surface and must
+not load `socksify.dll`. Do not treat a build as proof of artifact, deployment,
+UI smoke, service, driver, or endpoint correctness.
 
 ## Working Effectively
 
@@ -169,8 +178,8 @@ Create this file in the same directory as `ProxiFyre.exe`:
    - File: `socksify.vcxproj`
 
 3. **ProxiFyre** (`./ProxiFyre/`):
-   - C# console application (.NET Framework 4.7.2)
-   - Main entry point and service management
+   - C# WinForms engine-hosting application (.NET Framework 4.8)
+   - Main entry point, `MainForm`, and service runtime bootstrap
    - Key files: `Program.cs`, `ProxiFyre.csproj`
    - Dependencies: ProxiFyre.Configuration, NLog, Topshelf, and socksify; JSON is consumed transitively through the shared configuration library
 

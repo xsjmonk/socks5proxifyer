@@ -5,22 +5,100 @@ alwaysApply: true
 
 # Merge and Regression Guardrails
 
-When a merge, rebase, cherry-pick, conflict repair, or merge regression is
-detected, first load and follow
-`.cursor/skills/merge-maintenance/SKILL.md` before editing.
+Apply these rules automatically for merges, rebases, cherry-picks, conflict
+resolution, upstream integration, and merge-regression repair. The rule itself
+is complete; `.cursor/skills/merge-maintenance/SKILL.md` is supplementary.
 
-- Keep `ProxiFyre/Program.cs` as the WinForms entry point and launch `MainForm`.
-- Keep `ProxiFyreService` in `ProxiFyre/ProxiFyreService.cs`; it loads executable-relative `app-config.json`, `NLog.config`, proxies, exclusions, LAN bypass, and CIDR rules.
-- Include each source file exactly once in the project file. Never create duplicate `Program`, `ProxiFyreService`, or entry-point implementations.
-- Resolve conflicts by module ownership and parent comparison; never blindly select ours/theirs for a large file.
-- Keep UI, configuration, managed/native boundary, native router, policy, and tests in separate modules.
-- Keep one concern per change; extract adapters/coordinators from recurring large-file hotspots.
-- Validate `AddSocks5Proxy` handles before association or policy calls. Fix the first proxy-creation failure instead of reporting index errors.
-- Treat optional upstream PASS-filter rejection as non-fatal, preserving the established proxy-port fallback.
-- Preserve installer/service commands, configuration names/case, native routing policies, and UI behavior.
-- Run `scripts/Test-MergeMaintenance.ps1` after edits; it is read-only and driver-independent.
-- After a merge, search for markers, duplicate types, stale project includes, dead startup paths, placeholders, and generated artifacts.
-- Build the affected project and solution, and perform an executable/UI smoke check when possible.
-- Do not claim completion when runtime behavior, configuration loading, or driver-dependent behavior remains unverified.
+Before editing:
+- inspect repository instructions, `git status`, merge base, both parents,
+  changed/unmerged paths, affected projects, and the surrounding call graph;
+- classify each conflict by module ownership and understand both sides;
+- never choose wholesale ours/theirs for a large file.
 
-For the full workflow and trap list, read `.cursor/skills/merge-maintenance/SKILL.md`.
+Design and resolution principles:
+- preserve compatible independent features, stable public APIs, and behavior;
+- use adapters/overloads and narrow interfaces at boundaries;
+- keep one authoritative implementation per responsibility and one concern per
+  change; avoid formatting, package upgrades, cleanup, and generated churn;
+- keep exactly one owner for configuration, service bootstrap, UI entry point,
+  native boundary, routing policy, installer behavior, and tests;
+- use stable file placement and project inclusion exactly once;
+- resolve the first causal failure, not a downstream symptom;
+- review the final diff by module and remove markers, duplicate types,
+  duplicate implementations, stale references, placeholders, and generated
+  output.
+
+ProxiFyre invariants:
+- `ProxiFyre/Program.cs` has one WinForms `Main` that launches `MainForm`;
+- `ProxiFyre` is the engine-hosting WinForms surface: `MainForm` owns its UI
+  and the single `ProxiFyreService` owns runtime/network bootstrap;
+- `ProxiFyreUI` plus `ProxiFyreUILauncher` is the separate configuration and
+  service-management surface; it edits configuration, controls the service,
+  and must not load `socksify.dll`; both surfaces must remain functional;
+- UI and Topshelf use the same authoritative `ProxiFyreService`;
+- executable-relative `app-config.json`/`NLog.config`, JSON names/case,
+  normalization, validation, and compatibility remain unchanged;
+- proxy registration preserves protocols, address families, transport/TLS,
+  credentials, exclusions, LAN bypass, unresolved-process policy, CIDR, IPv4,
+  IPv6, lifecycle locking, rollback, and installer/service behavior;
+- reject invalid native handles before association or policy calls; native
+  index zero must remain valid;
+- optional PASS-filter failure is diagnosable and non-fatal, distinct from
+  proxy-creation failure;
+- bounded UI logs preserve order/readability and have an explicit startup-sized
+  retention limit; full file logging remains independent;
+- managed tests do not require a live driver, SOCKS endpoint, or service unless
+  explicitly marked integration.
+
+Verified ownership map:
+- engine UI/bootstrap: `ProxiFyre/Program.cs`, `ProxiFyre/MainForm.cs`,
+  `ProxiFyre/ProxiFyreService.cs`;
+- management UI: `ProxiFyreUI/`, native host: `ProxiFyreUILauncher/`;
+- schema/normalization/validation: `ProxiFyre.Configuration/`;
+- managed/native boundary: `socksify/Socksifier.*`;
+- native routing and process policy: `netlib/src/proxy/`, including
+  `netlib/src/proxy/process_routing_policy.h`;
+- destination inclusion: `socksify/policy/`;
+- installers/setup: `ProxiFyre.Installer/`, `ProxiFyre.Bundle/`,
+  `ProxiFyreSetupBootstrapper/`, `ProxiFyreSetupEngineExtension/`;
+- deterministic checks/tests: `scripts/`, `ProxiFyre.Tests/`.
+
+Validation layers are separate: source/static correctness, affected-project
+build, solution/installer build, published-artifact provenance, UI/service
+smoke behavior, and native driver/endpoint integration. A passing earlier
+layer never proves a later layer.
+
+When output or deployment changes, verify canonical `bin\exe\<platform>\<configuration>`
+versus published `Build\exe`, the matching executable, managed assemblies,
+`socksify.dll`, configuration, manifest, service `ImagePath`, shortcut,
+launcher, and installer payload. Verify the exact process tested; do not infer
+runtime identity from a repository path or successful compilation.
+
+Known merge hotspots and seams:
+- `ProxiFyre/Program.cs` ↔ `ProxiFyre/ProxiFyreService.cs`: keep entry-point
+  dispatch separate; use the service coordinator;
+- `ProxiFyre.Configuration/` ↔ `socksify/`: use typed registration adapters;
+- `socksify/` ↔ `netlib/src/proxy/`: preserve handle/lifecycle contracts and
+  optional filter fallback;
+- `build.ps1` ↔ `scripts/Test-ArtifactProvenance.ps1` ↔ installers: use one
+  manifest/published artifact set;
+- `ProxiFyreUI/Infrastructure/EngineLocator.cs` ↔ service/launcher paths:
+  reject stale executable identity rather than silently selecting it.
+
+Completion checklist:
+- no unmerged paths or conflict markers;
+- no duplicate types, entry points, compile entries, or stale references;
+- run `scripts/Test-MergeMaintenance.ps1`;
+- build affected projects, then the solution where possible;
+- run focused tests and executable/UI smoke tests when Windows supports them;
+- verify final runtime artifacts when output/deployment paths changed;
+- record exact native, driver, installer, and runtime limitations;
+- report changed modules, checks, unresolved risks, and remaining hotspots.
+
+Common traps: compilation without UI/runtime validation; stale or mismatched
+exe/DLL/config artifacts; duplicate service/entry points; treating native
+index zero as invalid; using invalid handles; turning optional filter failure
+fatal; changing JSON case/property names; changing first-match rule order to
+silence overlap warnings; silently truncating/duplicating logs; broad
+formatting/generated rewrites; and claiming success while required rules or
+runtime validation remain incomplete.

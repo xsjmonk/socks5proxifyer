@@ -5,9 +5,10 @@ description: Resolve upstream merges in the ProxiFyre repository while preservin
 
 # ProxiFyre Merge Maintenance
 
-Apply this automatically when the task involves a merge, rebase, cherry-pick,
-conflict resolution, or regression caused by integrating another branch.
-The first action is to load and follow this guidance before editing a conflict.
+Use this as supplementary expanded guidance when the task involves a merge,
+rebase, cherry-pick, conflict resolution, or regression caused by integrating
+another branch. The always-on rule and AGENTS.md are sufficient and remain the
+primary policy; this document must never be a prerequisite for compliance.
 
 ## Pre-merge inventory
 

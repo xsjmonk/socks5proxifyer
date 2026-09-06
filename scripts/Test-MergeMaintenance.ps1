@@ -75,6 +75,26 @@ foreach ($project in $projectFiles) {
 }
 if ($failures.Count -eq 0) { Pass "Project includes and references are consistent" }
 
+$ownedPaths = @(
+    "ProxiFyre\Program.cs",
+    "ProxiFyre\MainForm.cs",
+    "ProxiFyre\ProxiFyreService.cs",
+    "ProxiFyreUI",
+    "ProxiFyreUILauncher",
+    "ProxiFyre.Configuration",
+    "socksify\Socksifier.cpp",
+    "netlib\src\proxy\process_routing_policy.h",
+    "ProxiFyre.Installer",
+    "ProxiFyre.Bundle",
+    "scripts\Test-ArtifactProvenance.ps1"
+)
+foreach ($ownedPath in $ownedPaths) {
+    if (-not (Test-Path -LiteralPath (Join-Path $root $ownedPath))) {
+        Fail "Ownership path referenced by merge policy is missing: $ownedPath"
+    }
+}
+if ($failures.Count -eq 0) { Pass "Ownership paths are present" }
+
 $proxiFyreDirectory = Join-Path $root "ProxiFyre"
 $proxiFyreSources = @(Get-ChildItem -LiteralPath $proxiFyreDirectory -Filter "*.cs" -File)
 $typeMatches = @(
@@ -108,6 +128,24 @@ if ($serviceText -notmatch 'AddSocks5Proxy' -or
 } else {
     Pass "Native proxy handles are guarded before association"
 }
+
+$programText = Get-Content -LiteralPath (Join-Path $proxiFyreDirectory "Program.cs") -Raw
+if ($programText -match '\bpublic\s+void\s+Start\s*\(' -or
+    $programText -match '\bprivate\s+Socksifier') {
+    Fail "Program.cs contains a competing service bootstrap"
+} else {
+    Pass "No competing service bootstrap in Program.cs"
+}
+
+foreach ($requiredCheck in @(
+    "scripts\Test-ArtifactProvenance.ps1",
+    "scripts\Launch-ProxiFyreArtifact.ps1"
+)) {
+    if (-not (Test-Path -LiteralPath (Join-Path $root $requiredCheck))) {
+        Fail "Required artifact/deployment check is missing: $requiredCheck"
+    }
+}
+if ($failures.Count -eq 0) { Pass "Artifact/deployment checks are present" }
 
 $gitStatus = @(& git -c "safe.directory=*" status --short --untracked-files=all 2>$null)
 if ($LASTEXITCODE -ne 0) {
