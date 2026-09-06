@@ -454,8 +454,7 @@ namespace ProxiFyre.Configuration
                     {
                         issues.Add(Warning(
                             "APP_MATCH_SHADOWED",
-                            "This application match overlaps an earlier match in rule " +
-                            (shadowingMatch.RuleIndex + 1) + "; the earlier rule wins.",
+                            "This application match is covered by an earlier improved-proxy rule.",
                             RulePath(ruleIndex) + ".appNames[" + appIndex + "]",
                             ruleIndex));
                     }

@@ -83,6 +83,9 @@ namespace ProxiFyre.Configuration
         [JsonProperty("supportedAddressFamilies", NullValueHandling = NullValueHandling.Ignore)]
         public List<string> SupportedAddressFamilies { get; set; }
 
+        [JsonProperty("ipRanges", NullValueHandling = NullValueHandling.Ignore)]
+        public List<string> IpRanges { get; set; }
+
         [JsonExtensionData]
         public IDictionary<string, JToken> ExtensionData { get; set; }
 

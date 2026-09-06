@@ -1,123 +1,95 @@
-﻿using Newtonsoft.Json;
+﻿using System;
+using System.IO;
+using System.Linq;
+using System.Reflection;
 using NLog;
 using NLog.Config;
-using NLog.Targets;
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Reflection;
-
-// Aliases to avoid LogLevel ambiguity
-using SLogLevel = Socksifier.LogLevel;
-using ProtoEnum = Socksifier.SupportedProtocolsEnum;
+using ProxiFyre.Configuration;
+using Socksifier;
+using SocksifierLogLevel = Socksifier.LogLevel;
 
 namespace ProxiFyre
 {
-    public class ProxiFyreService
+    /// <summary>
+    /// Owns the single configuration-driven runtime bootstrap used by both the
+    /// WinForms UI and Topshelf service dispatch.
+    /// </summary>
+    public sealed class ProxiFyreService
     {
-        private static readonly Logger FileLog = LogManager.GetCurrentClassLogger();
-
+        private static readonly Logger LoggerInstance = LogManager.GetCurrentClassLogger();
         private Socksifier.Socksifier _socksify;
-        private SLogLevel _logLevel = SLogLevel.Info;
+        private SocksifierLogLevel _logLevel;
 
         public void Start()
         {
-            var exePath = Assembly.GetExecutingAssembly().Location;
-            var baseDir = Path.GetDirectoryName(exePath) ?? AppDomain.CurrentDomain.BaseDirectory;
-            var configPath = Path.Combine(baseDir, "app-config.json");
-            var nlogPath = Path.Combine(baseDir, "NLog.config");
+            var executablePath = Assembly.GetExecutingAssembly().Location;
+            var directoryPath = Path.GetDirectoryName(executablePath) ?? string.Empty;
+            var configFilePath = ProxiFyrePaths.GetConfigurationPath(executablePath);
+            var logConfigFilePath = Path.Combine(directoryPath, "NLog.config");
 
-            Console.WriteLine($"Loaded config: {configPath}");
+            if (File.Exists(logConfigFilePath))
+                LogManager.Configuration = new XmlLoggingConfiguration(logConfigFilePath);
 
-            var json = File.ReadAllText(configPath);
-            var cfg = JsonConvert.DeserializeObject<AppConfig>(json) ?? new AppConfig();
-
-            if (File.Exists(nlogPath))
-                LogManager.Configuration = new XmlLoggingConfiguration(nlogPath, true);
-
-            EnsureNLogConsoleMirroring();
-
-            _logLevel = ParseSocksifierLogLevel(cfg.logLevel);
+            ArtifactIdentity.Log(LoggerInstance, configFilePath);
+            var settings = LoadConfiguration(configFilePath);
+            _logLevel = MapLogLevel(ConfigurationValueParser.GetLogLevel(settings.LogLevel));
+            ConfigureManagedLogLevel(_logLevel);
 
             _socksify = Socksifier.Socksifier.GetInstance(_logLevel);
+            _socksify.LogEvent += LogPrinter;
+            _socksify.LogLimit = 100;
             _socksify.LogEventInterval = 1000;
 
-            _socksify.LogEvent += NativeLogToNLog;
-
-            // Configure LAN bypass if enabled (upstream: BypassLan)
-            if (cfg.bypassLan == true)
-            {
+            if (settings.BypassLan)
                 _socksify.SetBypassLan();
 
-                if (_logLevel >= SLogLevel.Info)
-                {
-                    var msg = "LAN bypass enabled - local network traffic will not be proxied.";
-                    FileLog.Info(msg);
-                    Console.WriteLine($"INFO: {msg}");
-                }
-            }
+            // The coordinator owns the invalid-handle guard: handle == IntPtr.Zero
+            // or -1 is rejected before association and the rule uses continue;
+            // semantics so later valid rules are still attempted.
+            var coordinator = new ProxyRuleRegistrationCoordinator();
+            var registration = coordinator.Register(
+                settings.Proxies,
+                new SocksifierProxyEngine(_socksify),
+                (index, rule) => LoggerInstance.Info(
+                    "Proxy rule {0}: endpoint={1}, credentials={2}/{3}, protocols={4}, addressFamilies={5}, transport={6}, tlsServerName={7}, fingerprint={8}, allowInvalidCertificate={9}, overload=full, start={10}.",
+                    index + 1,
+                    rule.Endpoint,
+                    rule.UsernameLength == 0 ? "none" : "present",
+                    rule.PasswordLength == 0 ? "none" : "present",
+                    rule.Protocols,
+                    rule.AddressFamilies,
+                    rule.Transport,
+                    rule.TlsServerName,
+                    string.IsNullOrEmpty(rule.TlsPinnedSha256) ? "absent" : "present",
+                    rule.TlsAllowInvalidCertificate,
+                    rule.Start),
+                (index, message) => LoggerInstance.Warn(
+                    "Proxy rule {0} ({1}): {2}.",
+                    index + 1,
+                    settings.Proxies[index]?.Socks5ProxyEndpoint ?? string.Empty,
+                    message),
+                (index, message) => LoggerInstance.Info(
+                    "Proxy rule {0}: {1}.", index + 1, message));
 
-            var anyAssociation = false;
-
-            foreach (var rule in (cfg.proxies ?? new List<ProxyRule>()))
+            if (!registration.AllRequiredRulesRegistered)
             {
-                var endpoint = rule.socks5ProxyEndpoint ?? "";
-                var proto = ParseProtocols(rule.supportedProtocols);
-
-                var handle = _socksify.AddSocks5Proxy(endpoint, rule.username, rule.password, proto, false);
-
-                if (handle == IntPtr.Zero || handle.ToInt64() == -1)
-                {
-                    Console.WriteLine($"WARN: AddSocks5Proxy({endpoint}) failed; skipping its associations.");
-                    continue;
-                }
-
-                foreach (var name in (rule.appNames ?? new List<string>()))
-                {
-                    var ok = _socksify.AssociateProcessNameToProxy(name, handle);
-                    if (ok)
-                    {
-                        anyAssociation = true;
-                        Console.WriteLine($"INFO: Associated {name} -> {endpoint} (protocols {ProtoPrint(proto)}).");
-                    }
-                    else
-                    {
-                        Console.WriteLine($"WARN: Failed to associate {name} -> {endpoint}.");
-                    }
-                }
-
-                if (rule.ipRanges != null && rule.appNames != null)
-                {
-                    foreach (var name in rule.appNames)
-                    foreach (var cidr in rule.ipRanges)
-                    {
-                        var added = _socksify.IncludeProcessDestinationCidr(name, cidr);
-                        if (added)
-                            Console.WriteLine($"INFO: Added CIDR {cidr} for process {name}.");
-                        else
-                            Console.WriteLine($"WARN: Failed to add CIDR {cidr} for process {name}.");
-                    }
-                }
+                var failedRules = string.Join(
+                    ", ",
+                    registration.Failures.Select(f =>
+                        (f.RuleIndex + 1) + ":" + f.Endpoint + ":" + f.Category));
+                throw new InvalidOperationException(
+                    "Required SOCKS5 proxy registration failed; the router was not started. " +
+                    "Failed rules: " + failedRules);
             }
 
-            if (cfg.excludes != null)
-            {
-                foreach (var ex in cfg.excludes)
-                {
-                    var ok = _socksify.ExcludeProcessName(ex);
-                    if (ok) Console.WriteLine($"INFO: Excluded {ex}.");
-                    else Console.WriteLine($"WARN: Failed to exclude {ex}.");
-                }
-            }
+            foreach (var excludedEntry in settings.Excludes ?? Enumerable.Empty<string>())
+                _socksify.ExcludeProcessName(excludedEntry);
 
-            if (!anyAssociation)
-                Console.WriteLine("WARN: No process-to-proxy associations were registered. Nothing to do.");
+            if (!_socksify.Start())
+                throw new InvalidOperationException(
+                    "The ProxiFyre native router could not be started.");
 
-            var started = _socksify.Start();
-            if (!started)
-                Console.Error.WriteLine("ERROR: Failed to start native router.");
-
-            FileLog.Info("ProxiFyre Service is running...");
+            LoggerInstance.Info("ProxiFyre Service is running...");
         }
 
         public void Stop()
@@ -129,107 +101,149 @@ namespace ProxiFyre
             }
             finally
             {
-                FileLog.Info("ProxiFyre Service has stopped.");
                 LogManager.Shutdown();
             }
         }
 
-        private void NativeLogToNLog(object sender, Socksifier.LogEventArgs e)
+        private static ProxiFyreConfiguration LoadConfiguration(string filePath)
         {
-            if (e?.Log == null) return;
+            if (!File.Exists(filePath))
+                throw new InvalidOperationException(
+                    "Configuration file not found: " + filePath);
 
-            foreach (var entry in e.Log)
+            var configuration = new ConfigurationSerializer().Load(filePath);
+            var validation = new ConfigurationValidator().Validate(configuration);
+            if (validation.HasErrors)
+                throw new InvalidOperationException(
+                    "ProxiFyre configuration validation failed.");
+
+            foreach (var warning in validation.Warnings)
+                LoggerInstance.Warn(warning.Message);
+
+            return new ConfigurationNormalizer().Normalize(configuration);
+        }
+
+        private static SocksifierLogLevel MapLogLevel(ConfigurationLogLevel logLevel)
+        {
+            switch (logLevel)
             {
-                var msg = (entry?.Description ?? string.Empty).Trim();
-                if (msg.Length == 0) continue;
-
-                FileLog.Info(msg);      // keep file logging
-                Console.WriteLine(msg); // mirror to UI (stdout → textbox)
+                case ConfigurationLogLevel.Error: return SocksifierLogLevel.Error;
+                case ConfigurationLogLevel.Warning: return SocksifierLogLevel.Warning;
+                case ConfigurationLogLevel.Debug: return SocksifierLogLevel.Debug;
+                case ConfigurationLogLevel.All: return SocksifierLogLevel.All;
+                default: return SocksifierLogLevel.Info;
             }
         }
 
-        private static void EnsureNLogConsoleMirroring()
+        private static void ConfigureManagedLogLevel(SocksifierLogLevel level)
         {
-            var cfg = LogManager.Configuration ?? new LoggingConfiguration();
+            var configuration = LogManager.Configuration;
+            if (configuration == null)
+                return;
 
-            var consoleOut = cfg.FindTargetByName<ConsoleTarget>("uiConsoleOut");
-            if (consoleOut == null)
-            {
-                consoleOut = new ConsoleTarget("uiConsoleOut") { Error = false };
-                cfg.AddTarget(consoleOut);
-                cfg.AddRule(NLog.LogLevel.Trace, NLog.LogLevel.Info, consoleOut);
-            }
+            var minimum = level == SocksifierLogLevel.Error
+                ? NLog.LogLevel.Error
+                : level == SocksifierLogLevel.Warning
+                    ? NLog.LogLevel.Warn
+                    : level == SocksifierLogLevel.Debug || level == SocksifierLogLevel.All
+                        ? NLog.LogLevel.Debug
+                        : NLog.LogLevel.Info;
 
-            var consoleErr = cfg.FindTargetByName<ConsoleTarget>("uiConsoleErr");
-            if (consoleErr == null)
-            {
-                consoleErr = new ConsoleTarget("uiConsoleErr") { Error = true };
-                cfg.AddTarget(consoleErr);
-                cfg.AddRule(NLog.LogLevel.Warn, NLog.LogLevel.Fatal, consoleErr);
-            }
-
-            LogManager.Configuration = cfg;
+            foreach (var rule in configuration.LoggingRules)
+                rule.SetLoggingLevels(minimum, NLog.LogLevel.Fatal);
             LogManager.ReconfigExistingLoggers();
         }
 
-        private static SLogLevel ParseSocksifierLogLevel(string s)
+        private static void LogPrinter(object sender, LogEventArgs eventArgs)
         {
-            if (string.IsNullOrWhiteSpace(s)) return SLogLevel.Info;
-            try { return (SLogLevel)Enum.Parse(typeof(SLogLevel), s, true); }
-            catch { return SLogLevel.Info; }
-        }
-
-        private static ProtoEnum ParseProtocols(List<string> list)
-        {
-            if (list == null || list.Count == 0) return ProtoEnum.BOTH;
-
-            var hasTcp = false;
-            var hasUdp = false;
-
-            foreach (var s in list)
+            foreach (var entry in eventArgs.Log.Where(entry => entry != null))
             {
-                if (s == null) continue;
-                var u = s.Trim().ToUpperInvariant();
-                if (u == "TCP") hasTcp = true;
-                else if (u == "UDP") hasUdp = true;
-                else if (u == "BOTH") { hasTcp = true; hasUdp = true; }
-            }
-
-            if (hasTcp && hasUdp) return ProtoEnum.BOTH;
-            if (hasTcp) return ProtoEnum.TCP;
-            if (hasUdp) return ProtoEnum.UDP;
-            return ProtoEnum.BOTH;
-        }
-
-        private static string ProtoPrint(ProtoEnum p)
-        {
-            switch (p)
-            {
-                case ProtoEnum.TCP: return "TCP";
-                case ProtoEnum.UDP: return "UDP";
-                case ProtoEnum.BOTH: return "TCP"; // keep original behavior
-                default: return "TCP";
+                var message = (entry.Description ?? string.Empty)
+                    .Replace("\r", string.Empty)
+                    .Replace("\n", string.Empty);
+                LoggerInstance.Log(GetNativeLogLevel(message), message);
             }
         }
 
-        private class AppConfig
+        private static NLog.LogLevel GetNativeLogLevel(string message)
         {
-            public string logLevel { get; set; } = "Info";
-            public List<ProxyRule> proxies { get; set; } = new List<ProxyRule>();
-            public List<string> excludes { get; set; } = new List<string>();
+            LogMessageLevel nativeLevel;
+            if (!LogMessageLevelParser.TryGetLeadingNativeLevel(message, out nativeLevel))
+                return NLog.LogLevel.Info;
 
-            [JsonProperty("bypassLan", NullValueHandling = NullValueHandling.Ignore)]
-            public bool? bypassLan { get; set; } = false;
+            switch (nativeLevel)
+            {
+                case LogMessageLevel.Error: return NLog.LogLevel.Error;
+                case LogMessageLevel.Warning: return NLog.LogLevel.Warn;
+                case LogMessageLevel.Debug: return NLog.LogLevel.Debug;
+                default: return NLog.LogLevel.Info;
+            }
         }
 
-        private class ProxyRule
+        private sealed class SocksifierProxyEngine : IProxyEngineBoundary
         {
-            public List<string> appNames { get; set; } = new List<string>();
-            public string socks5ProxyEndpoint { get; set; }
-            public string username { get; set; }
-            public string password { get; set; }
-            public List<string> supportedProtocols { get; set; } = new List<string>();
-            public List<string> ipRanges { get; set; }
+            private readonly Socksifier.Socksifier _engine;
+
+            public SocksifierProxyEngine(Socksifier.Socksifier engine)
+            {
+                _engine = engine ?? throw new ArgumentNullException(nameof(engine));
+            }
+
+            public IntPtr AddSocks5Proxy(NativeProxyRuleSettings settings)
+            {
+                return _engine.AddSocks5Proxy(
+                    settings.Endpoint,
+                    settings.Username,
+                    settings.Password,
+                    MapProtocols(settings.Protocols),
+                    MapAddressFamilies(settings.AddressFamilies),
+                    MapTransport(settings.Transport),
+                    settings.TlsServerName,
+                    settings.TlsPinnedSha256,
+                    settings.TlsAllowInvalidCertificate,
+                    settings.Start);
+            }
+
+            public bool AssociateProcessNameToProxy(string processName, IntPtr handle)
+            {
+                return _engine.AssociateProcessNameToProxy(processName, handle);
+            }
+
+            public bool IncludeProcessDestinationCidr(string processName, string cidr)
+            {
+                return _engine.IncludeProcessDestinationCidr(processName, cidr);
+            }
+
+            public bool ExcludeProcessName(string processName)
+            {
+                return _engine.ExcludeProcessName(processName);
+            }
+
+            private static SupportedProtocolsEnum MapProtocols(ProxyProtocolSelection selection)
+            {
+                if (selection == ProxyProtocolSelection.Tcp)
+                    return SupportedProtocolsEnum.TCP;
+                if (selection == ProxyProtocolSelection.Udp)
+                    return SupportedProtocolsEnum.UDP;
+                return SupportedProtocolsEnum.BOTH;
+            }
+
+            private static SupportedAddressFamiliesEnum MapAddressFamilies(
+                ProxyAddressFamilySelection selection)
+            {
+                if (selection == ProxyAddressFamilySelection.Ipv4)
+                    return SupportedAddressFamiliesEnum.IPv4;
+                if (selection == ProxyAddressFamilySelection.Ipv6)
+                    return SupportedAddressFamiliesEnum.IPv6;
+                return SupportedAddressFamiliesEnum.BOTH;
+            }
+
+            private static Socks5TransportEnum MapTransport(Socks5TransportKind transport)
+            {
+                return transport == Socks5TransportKind.Tls
+                    ? Socks5TransportEnum.TLS
+                    : Socks5TransportEnum.TCP;
+            }
         }
     }
 }

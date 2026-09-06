@@ -4,14 +4,15 @@ using System.Drawing;
 using System.Reflection;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using ProxiFyre.Configuration;
 
 namespace ProxiFyre
 {
     public partial class MainForm : Form
     {
         readonly ProxiFyreService _service;
+        readonly UiLogBuffer _logBuffer = new UiLogBuffer();
         bool _started;
-        const int MaxLogChars = 3000;
 
         public MainForm(ProxiFyreService service)
         {
@@ -206,22 +207,9 @@ namespace ProxiFyre
             if (!toAppend.EndsWith(Environment.NewLine))
                 toAppend += Environment.NewLine;
 
-            // If the new total would exceed MaxLogChars, trim from the beginning
-            var newLength = logTextBox.TextLength + toAppend.Length;
-            if (newLength > MaxLogChars)
-            {
-                var removeCount = newLength - MaxLogChars;
-
-                // Try to cut on a line boundary to avoid half lines
-                var cutAt = removeCount;
-                var nl = logTextBox.Text.IndexOf(Environment.NewLine, removeCount);
-                if (nl >= 0) cutAt = nl + Environment.NewLine.Length;
-
-                logTextBox.Select(0, Math.Min(cutAt, logTextBox.TextLength));
-                logTextBox.SelectedText = string.Empty;
-            }
-
-            logTextBox.AppendText(toAppend);
+            _logBuffer.Append(toAppend);
+            logTextBox.Text = _logBuffer.Text;
+            logRetentionLabel.Visible = _logBuffer.WasTrimmed;
 
             // Keep caret at end and autoscroll
             logTextBox.SelectionStart = logTextBox.TextLength;

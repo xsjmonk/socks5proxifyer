@@ -72,6 +72,8 @@
     <Compile Include="ConfigurationNormalizer.cs" />
     <Compile Include="ConfigurationSerializer.cs" />
     <Compile Include="ConfigurationValidator.cs" />
+    <Compile Include="ProxyRuleRegistration.cs" />
+    <Compile Include="UiLogBuffer.cs" />
     <Compile Include="ConfigurationValueParser.cs" />
     <Compile Include="EngineCommandLinePolicy.cs" />
     <Compile Include="EndpointParser.cs" />

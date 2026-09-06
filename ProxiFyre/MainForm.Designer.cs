@@ -4,6 +4,7 @@
     {
         System.ComponentModel.IContainer components = null;
         System.Windows.Forms.TextBox logTextBox;
+        System.Windows.Forms.Label logRetentionLabel;
         System.Windows.Forms.NotifyIcon notifyIcon;
 
         protected override void Dispose(bool disposing)
@@ -19,6 +20,7 @@
         {
             components = new System.ComponentModel.Container();
             logTextBox = new System.Windows.Forms.TextBox();
+            logRetentionLabel = new System.Windows.Forms.Label();
             notifyIcon = new System.Windows.Forms.NotifyIcon(components);
 
             SuspendLayout();
@@ -31,6 +33,15 @@
             logTextBox.Dock = System.Windows.Forms.DockStyle.Fill;
             logTextBox.Font = new System.Drawing.Font("Consolas", 9.75F);
 
+            // logRetentionLabel
+            logRetentionLabel.Dock = System.Windows.Forms.DockStyle.Bottom;
+            logRetentionLabel.Height = 22;
+            logRetentionLabel.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+            logRetentionLabel.Padding = new System.Windows.Forms.Padding(6, 0, 0, 0);
+            logRetentionLabel.BackColor = System.Drawing.Color.LightGoldenrodYellow;
+            logRetentionLabel.Text = "Older UI lines were removed; the complete history remains in the NLog file.";
+            logRetentionLabel.Visible = false;
+
             // notifyIcon
             notifyIcon.Text = "ProxiFyre";
 
@@ -39,6 +50,7 @@
             AutoScaleMode = System.Windows.Forms.AutoScaleMode.Dpi;
             ClientSize = new System.Drawing.Size(900, 520);
             Controls.Add(logTextBox);
+            Controls.Add(logRetentionLabel);
             MinimumSize = new System.Drawing.Size(600, 300);
             Name = "MainForm";
             StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen;

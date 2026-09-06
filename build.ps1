@@ -1,6 +1,7 @@
 param(
     [string]$Configuration = "Release",
-    [string]$Platform = "x64"
+    [string]$Platform = "x64",
+    [string]$ConfigurationPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -104,6 +105,82 @@ function Copy-DirectoryContents {
     Copy-Item -Path (Join-Path $SourceDir "*") -Destination $DestinationDir -Recurse -Force
 }
 
+function Get-PeMachine {
+    param([string]$FilePath)
+
+    $stream = [System.IO.File]::OpenRead($FilePath)
+    try {
+        $reader = [System.IO.BinaryReader]::new($stream)
+        if ($stream.Length -lt 64) {
+            return ""
+        }
+
+        $dosSignature = $reader.ReadUInt16()
+        if ($dosSignature -ne 0x5a4d) {
+            return ""
+        }
+
+        $stream.Position = 0x3c
+        $peOffset = $reader.ReadInt32()
+        if ($peOffset -lt 0 -or $peOffset + 6 -gt $stream.Length) {
+            return ""
+        }
+
+        $stream.Position = $peOffset + 4
+        if ($reader.ReadUInt32() -ne 0x00004550) {
+            return ""
+        }
+
+        return ("0x{0:x4}" -f $reader.ReadUInt16())
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Write-ArtifactManifest {
+    param(
+        [string]$DeploymentDirectory,
+        [string]$ConfigurationName,
+        [string]$PlatformName
+    )
+
+    $required = @(
+        @{ Name = "ProxiFyre.exe"; RelativePath = "ProxiFyre.exe" }
+        @{ Name = "socksify.dll"; RelativePath = "socksify.dll" }
+        @{ Name = "ProxiFyre.Configuration.dll"; RelativePath = "ProxiFyre.Configuration.dll" }
+    )
+    foreach ($entry in $required) {
+        $path = Join-Path $DeploymentDirectory $entry.RelativePath
+        if (-not (Test-Path -LiteralPath $path)) {
+            throw "The deployment unit is incomplete; missing $($entry.RelativePath)."
+        }
+    }
+
+    $artifacts = foreach ($file in Get-ChildItem -LiteralPath $DeploymentDirectory -Recurse -File) {
+        $relativePath = [IO.Path]::GetRelativePath($DeploymentDirectory, $file.FullName)
+        [pscustomobject]@{
+            Name = $file.Name
+            RelativePath = $relativePath
+            Sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            Length = $file.Length
+            TimestampUtc = $file.LastWriteTimeUtc.ToString("O")
+            FileVersion = $file.VersionInfo.FileVersion
+            PEMachine = Get-PeMachine -FilePath $file.FullName
+        }
+    }
+
+    $manifest = [pscustomobject]@{
+        Schema = 1
+        Configuration = $ConfigurationName
+        Platform = $PlatformName
+        CreatedUtc = [DateTime]::UtcNow.ToString("O")
+        Artifacts = @($artifacts)
+    }
+    $manifest | ConvertTo-Json -Depth 4 |
+        Set-Content -LiteralPath (Join-Path $DeploymentDirectory "artifact-provenance.json") -Encoding UTF8
+}
+
 function Remove-IfExists {
     param([string]$PathToRemove)
 
@@ -194,6 +271,21 @@ $outputRoots = @(
 foreach ($entry in $outputRoots) {
     Copy-DirectoryContents -SourceDir $entry.Source -DestinationDir $entry.Destination
 }
+
+Write-Info "Writing artifact provenance manifest"
+# Build\exe is the single launch/deployment unit. Keep the diagnostic copy in
+# Build\dll for inspection, but never require callers to mix trees manually.
+Copy-Item -LiteralPath (Join-Path $stagingDir "dll\socksify.dll") `
+    -Destination (Join-Path $stagingDir "exe\socksify.dll") -Force
+if (-not [string]::IsNullOrWhiteSpace($ConfigurationPath)) {
+    if (-not (Test-Path -LiteralPath $ConfigurationPath -PathType Leaf)) {
+        throw "Configuration file not found: $ConfigurationPath"
+    }
+    Copy-Item -LiteralPath $ConfigurationPath `
+        -Destination (Join-Path $stagingDir "exe\app-config.json") -Force
+}
+Write-ArtifactManifest -DeploymentDirectory (Join-Path $stagingDir "exe") `
+    -ConfigurationName $Configuration -PlatformName $Platform
 
 Write-Info "Removing intermediate and original output folders"
 $cleanupTargets = [System.Collections.Generic.List[string]]::new()

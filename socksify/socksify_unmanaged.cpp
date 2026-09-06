@@ -285,6 +285,11 @@ LONG_PTR socksify_unmanaged::add_socks5_proxy(
         login.size() > proxy::socks5_username_max_length ||
         password.size() > proxy::socks5_username_max_length)
     {
+        print_log(log_level_mx::error,
+            "Rejected SOCKS5 proxy registration: credentials must be both empty or "
+            "both present and within the native length limit (username length " +
+            std::to_string(login.size()) + ", password length " +
+            std::to_string(password.size()) + ").");
         return -1;
     }
 
@@ -340,7 +345,9 @@ LONG_PTR socksify_unmanaged::add_socks5_proxy(
     if (const auto result = proxy_->add_socks5_proxy(
         endpoint, protocols, cred, address_families, upstream_options, start); result)
     {
-        return static_cast<LONG_PTR>(result.value());
+        // The managed API uses IntPtr.Zero as "creation failed". Encode the
+        // zero-based native index so index 0 remains a valid managed handle.
+        return static_cast<LONG_PTR>(result.value()) + 1;
     }
 
     return -1;
@@ -382,7 +389,11 @@ LONG_PTR socksify_unmanaged::add_socks5_proxy(
 bool socksify_unmanaged::associate_process_name_to_proxy(const std::wstring& process_name,
     const LONG_PTR proxy_id) const
 {
-    return proxy_->associate_process_name_to_proxy(process_name, static_cast<size_t>(proxy_id));
+    // Decode the one-based managed handle back to the native zero-based index.
+    if (proxy_id <= 0)
+        return false;
+    return proxy_->associate_process_name_to_proxy(
+        process_name, static_cast<size_t>(proxy_id - 1));
 }
 
 /**

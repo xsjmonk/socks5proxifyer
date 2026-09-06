@@ -110,6 +110,7 @@
       <Link>EngineServiceInstallLocationPolicy.cs</Link>
     </Compile>
     <Compile Include="NativeDependencyLoader.cs" />
+    <Compile Include="ArtifactIdentity.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="MainForm.cs">
       <SubType>Form</SubType>

@@ -68,6 +68,7 @@ app-config.json
 /Build/
 /Build.staging/
 socksify/x64/
+socksify/socksify/
 socksify/Win32/
 socksify/ARM64/
 *.aps
