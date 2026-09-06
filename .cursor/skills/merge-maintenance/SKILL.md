@@ -24,8 +24,14 @@ and parent-specific file inspection. Preserve the user's existing worktree chang
 
 ## Non-negotiable product behavior
 
-- The WinForms application is the primary UI. `ProxiFyre/Program.cs` must launch `MainForm`; do not replace it with a service-only or Topshelf entry point.
-- `MainForm` owns the desktop UI. `ProxiFyreService` owns runtime initialization. Keep them as separate classes and files.
+- `ProxiFyre` is the engine-hosting WinForms surface. Its `Program.cs` owns
+  the single entry point, `MainForm` owns its UI, and `ProxiFyreService` owns
+  runtime/network bootstrap.
+- `ProxiFyreUI` plus `ProxiFyreUILauncher` is the separate configuration and
+  service-management surface. It edits configuration and controls the engine,
+  must not load `socksify.dll`, and must remain functional with the engine UI.
+- Both surfaces share the intended service/configuration contracts; neither
+  may create a second networking engine.
 - Startup must load `app-config.json` beside the executable, configure `NLog.config`, create the native `Socksifier`, register proxies, exclusions, LAN bypass, and per-process CIDR rules, then start the router.
 - Preserve the existing configuration schema and case-sensitive JSON property mappings unless a deliberate migration is implemented and tested.
 - Never associate a process with an invalid proxy handle. Check the result of `AddSocks5Proxy` before calling association or CIDR APIs.
@@ -36,13 +42,19 @@ and parent-specific file inspection. Preserve the user's existing worktree chang
 
 Keep changes in the smallest responsible module:
 
-- UI startup and window behavior: `ProxiFyre/Program.cs`, `ProxiFyre/MainForm.cs`, and designer files.
-- Configuration and proxy bootstrap: `ProxiFyre/ProxiFyreService.cs`.
+- Engine UI/bootstrap: `ProxiFyre/Program.cs`, `ProxiFyre/MainForm.cs`,
+  `ProxiFyre/ProxiFyreService.cs`.
+- Management UI: `ProxiFyreUI/`; native management host:
+  `ProxiFyreUILauncher/`.
+- Schema, serializer, normalization, validation, persistence, compatibility:
+  `ProxiFyre.Configuration/`.
 - Managed/native boundary: `socksify/Socksifier.*`.
-- Native router and packet policy: `netlib/src/proxy/*`.
-- Destination inclusion policy: `socksify/policy/*`.
-- Configuration models and validation: `ProxiFyre.Configuration/*`.
-- Tests for each module stay with that module.
+- Native routing and process policy: `netlib/src/proxy/`, including
+  `netlib/src/proxy/process_routing_policy.h`.
+- Destination inclusion policy: `socksify/policy/`.
+- Installer/setup: `ProxiFyre.Installer/`, `ProxiFyre.Bundle/`,
+  `ProxiFyreSetupBootstrapper/`, `ProxiFyreSetupEngineExtension/`.
+- Deterministic validation/tests: `scripts/` and `ProxiFyre.Tests/`.
 
 Do not move service code into the UI entry-point file, duplicate classes across files, or combine unrelated upstream features into a monolithic conflict resolution. Prefer a new adapter/helper file when two branches modify the same large file for unrelated reasons.
 
@@ -62,6 +74,27 @@ Enforce one concern per change. When unrelated branches repeatedly edit one
 large file, extract a coordinator, adapter, or helper with a stable interface;
 do not repeatedly grow the hotspot. Keep compatibility shims at module
 boundaries and put new behavior in the owning module.
+
+Preserve configuration schema, property casing, normalization, validation,
+first-match ordering, and unknown-field compatibility. Keep stable public APIs
+and use narrow interfaces, adapters, or overloads at cross-module seams.
+Include each project file exactly once. Preserve UI log ordering/readability,
+explicit startup-sized bounded retention, and independent full file logging.
+Preserve service commands, installer payloads, shortcuts, protected paths,
+architecture-specific packaging, and native handle/index semantics including
+valid zero-based index handling, lifecycle locks, rollback, optional-filter
+fallback, and diagnostics.
+
+Known hotspots and preferred seams:
+- `Program.cs` ↔ `ProxiFyreService.cs`: keep dispatch/UI separate and use one
+  service implementation;
+- `ProxiFyre.Configuration/` ↔ `socksify/`: use typed registration adapters;
+- `socksify/` ↔ `netlib/src/proxy/`: preserve handle, lifecycle, rollback, and
+  optional-filter contracts;
+- `build.ps1` ↔ `scripts/Test-ArtifactProvenance.ps1` ↔ installers: use one
+  published manifest-backed artifact set;
+- `ProxiFyreUI/Infrastructure/EngineLocator.cs` ↔ service/launcher paths:
+  reject stale executable identity.
 
 ## Conflict-resolution procedure
 
@@ -87,6 +120,20 @@ boundaries and put new behavior in the owning module.
 - Optional driver-dependent optimizations may fall back, but filter failures must remain diagnosable and must not erase required routing.
 - Logging must not duplicate one native event through multiple uncoordinated sinks.
 
+Validation layers are distinct: source/static correctness, affected-project
+build, solution/installer build, published-artifact provenance, UI/service
+smoke behavior, and native driver/endpoint integration. Success in an earlier
+layer never proves a later layer. Report unavailable Windows tooling, driver,
+endpoint, or installer validation honestly.
+
+When output or deployment files change, verify canonical
+`bin\exe\<platform>\<configuration>` versus published `Build\exe`, matching
+executable, managed assemblies, `socksify.dll`, configuration, and manifest,
+plus architecture/version/hash consistency. Verify service `ImagePath`,
+shortcuts, launcher, UI-selected engine path, installer payload, exact
+process executable, and loaded assembly/native paths. A successful build or
+repository path is not runtime proof.
+
 ## Validation matrix
 
 | Check | Purpose | If unavailable |
@@ -95,6 +142,7 @@ boundaries and put new behavior in the owning module.
 | Affected-project build | local syntax and project membership | report tool/environment blocker |
 | Solution build | cross-project contracts and installer wiring | report exact failing project |
 | Focused tests | config, UI seams, policy, and lifecycle behavior | run deterministic checks; document gap |
+| Artifact provenance | hashes, versions, architecture, manifest, paths | report stale/mismatched output |
 | Executable/UI smoke test | actual `MainForm` launch and config bootstrap | document Windows/UI limitation |
 | Service/installer check | command and package behavior | document unavailable Windows tooling |
 | Driver-dependent check | NDIS/filter/routing behavior | do not fake success; report driver limitation |
@@ -119,7 +167,12 @@ recoverable and request a decision when behavior cannot be inferred safely.
 - A failed native filter insertion can be non-fatal. Do not convert an optional optimization failure into `-1` proxy creation.
 - Logging the same event through both NLog and redirected console output creates misleading duplicates.
 - Association “index out of range” usually means proxy creation failed earlier. Fix the first failure and guard the caller.
+- A successful build does not prove the selected executable, managed DLL,
+  native DLL, configuration, service registration, or shortcut belong together.
 - Do not hide a driver failure by deleting all filter logic. Preserve the established fallback behavior and make the failure diagnosable at the correct severity.
+- Do not fix overlap warnings by changing first-match rule ordering.
+- Do not silently truncate or duplicate bounded UI logs; full file history is
+  independent of the visible pane.
 - Do not run broad formatting or generated-file rewrites while resolving a merge; they increase future conflict surface.
 - Do not change installer/service behavior merely to make an interactive UI build pass.
 
@@ -129,9 +182,11 @@ The merge is complete only when:
 
 - no unmerged paths or conflict markers remain;
 - one UI entry point launches `MainForm`;
+- both UI surfaces remain functional with one engine/service implementation;
 - the original configuration-driven bootstrap is present and reachable;
 - every native handle is validated before use;
 - module boundaries are clear and duplicate implementations are removed;
 - focused build/tests pass, or a concrete external blocker is documented.
 - the read-only merge-maintenance check passes;
+- artifact/deployment identity is verified whenever output paths changed;
 - remaining hotspots and Windows/driver-only limitations are explicitly reported.
