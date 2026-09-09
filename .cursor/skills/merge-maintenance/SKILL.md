@@ -22,6 +22,19 @@ Record before editing:
 Use `git status`, `git diff --name-only`, `git diff --name-only --diff-filter=U`,
 and parent-specific file inspection. Preserve the user's existing worktree changes.
 
+For every configuration-related conflict, create a field inventory before
+editing. For each root and rule node record the JSON property name and casing,
+model property, serializer/deserializer behavior, normalizer/copy/clone path,
+validator behavior, runtime registration or UI consumer, native/UI boundary
+when applicable, and its regression test. Treat loss in any intermediate
+representation as a merge failure: model presence alone is not support.
+Compare the known-good parent with the merged path to find mappers, adapters,
+normalizers, or DTOs that may drop fields. Keep fields in the module that owns
+their concern; do not add routing policy to transport/native settings DTOs.
+Every new or merged node needs a round-trip or end-to-end pipeline test covering
+populated and omitted/null semantics where meaningful, using the product's
+actual configuration shape rather than only a directly instantiated model.
+
 ## Non-negotiable product behavior
 
 - `ProxiFyre` is the engine-hosting WinForms surface. Its `Program.cs` owns
@@ -147,7 +160,9 @@ repository path is not runtime proof.
 | Service/installer check | command and package behavior | document unavailable Windows tooling |
 | Driver-dependent check | NDIS/filter/routing behavior | do not fake success; report driver limitation |
 
-The repository check is `scripts/Test-MergeMaintenance.ps1`; it is read-only
+The repository check is `scripts/Test-MergeMaintenance.ps1`; run it with no
+arguments from the repository or with `-RepoRoot <path>`. Use
+`-VerifyConfigurationSchema` for the optional model/pipeline coverage check. It is read-only
 and must not require a SOCKS5 server, NDIS driver, database, or network.
 
 ## Unsafe or ambiguous conflicts

@@ -24,6 +24,8 @@ Design and resolution principles:
   native boundary, routing policy, installer behavior, and tests;
 - use stable file placement and project inclusion exactly once;
 - resolve the first causal failure, not a downstream symptom;
+- preserve every configuration field through deserialize, validate,
+  normalize/clone, and its runtime or UI consumer;
 - review the final diff by module and remove markers, duplicate types,
   duplicate implementations, stale references, placeholders, and generated
   output.
@@ -49,6 +51,8 @@ ProxiFyre invariants:
   retention limit; full file logging remains independent;
 - managed tests do not require a live driver, SOCKS endpoint, or service unless
   explicitly marked integration.
+- For configuration conflicts, inventory each root/rule field and require a
+  populated and omitted/null pipeline regression test.
 
 Verified ownership map:
 - engine UI/bootstrap: `ProxiFyre/Program.cs`, `ProxiFyre/MainForm.cs`,

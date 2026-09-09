@@ -1,10 +1,24 @@
 [CmdletBinding()]
 param(
-    [string]$RepoRoot = (Join-Path $PSScriptRoot "..")
+    [string]$RepoRoot = "",
+    [switch]$VerifyConfigurationSchema
 )
 
 $ErrorActionPreference = "Stop"
-$root = (Resolve-Path -LiteralPath $RepoRoot).Path
+if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+    $scriptDirectory = if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        $PSScriptRoot
+    } else {
+        Split-Path -Parent $MyInvocation.MyCommand.Path
+    }
+    $RepoRoot = Join-Path $scriptDirectory ".."
+}
+try {
+    $root = (Resolve-Path -LiteralPath $RepoRoot -ErrorAction Stop).Path
+} catch {
+    Write-Error "Unable to resolve repository root '$RepoRoot': $($_.Exception.Message)"
+    exit 1
+}
 $failures = [System.Collections.Generic.List[string]]::new()
 
 function Fail([string]$Message) {
@@ -159,6 +173,27 @@ foreach ($statusLine in @($gitStatus)) {
     }
 }
 if ($failures.Count -eq 0) { Pass "No generated output changes detected" }
+
+if ($VerifyConfigurationSchema) {
+    $models = Get-Content -LiteralPath (Join-Path $root "ProxiFyre.Configuration\Models.cs") -Raw
+    $normalizer = Get-Content -LiteralPath (Join-Path $root "ProxiFyre.Configuration\ConfigurationNormalizer.cs") -Raw
+    $tests = Get-Content -LiteralPath (Join-Path $root "ProxiFyre.Tests\ConfigurationNormalizerTests.cs") -Raw
+    $jsonFields = @(
+        [regex]::Matches($models, '\[JsonProperty\("([^"]+)"') |
+            ForEach-Object { $_.Groups[1].Value } |
+            Sort-Object -Unique
+    )
+    if ($jsonFields.Count -eq 0) {
+        Fail "Configuration schema inventory is empty"
+    } elseif ($normalizer -notmatch 'NormalizeRule') {
+        Fail "Configuration schema has no normalization pipeline"
+    } elseif ($tests -notmatch 'ConfigurationSerializer' -or
+        $tests -notmatch 'ConfigurationNormalizer') {
+        Fail "Configuration schema has no deserialize/normalize regression test"
+    } else {
+        Pass "Configuration schema has model, normalization, and pipeline-test coverage"
+    }
+}
 
 if ($failures.Count -gt 0) {
     Write-Host "$($failures.Count) merge-maintenance check(s) failed." -ForegroundColor Red
