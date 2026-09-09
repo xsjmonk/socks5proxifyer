@@ -111,6 +111,44 @@ namespace ProxiFyre.Tests
         }
 
         [Test]
+        public void AppConfigDestinationRangesSurviveNormalizationAndRegisterPerApplication()
+        {
+            var json = "{\"proxies\":[" +
+                "{\"appNames\":[\"idea64\",\"rider64\"],\"socks5ProxyEndpoint\":\"127.0.0.1:1080\",\"ipRanges\":[\"192.168.100.0/24\"]}," +
+                "{\"appNames\":[\"rdcman\",\"mstsc\"],\"socks5ProxyEndpoint\":\"127.0.0.1:1081\",\"ipRanges\":[\"192.168.100.0/24\"]}]}";
+            var configuration = new ConfigurationSerializer().Deserialize(json);
+            Assert.That(new ConfigurationValidator().Validate(configuration).IsValid, Is.True);
+            var normalized = new ConfigurationNormalizer().Normalize(configuration);
+            var fake = new FakeProxyEngine(new IntPtr(1));
+
+            new ProxyRuleRegistrationCoordinator().Register(
+                normalized.Proxies, fake, null, null, null);
+
+            Assert.That(fake.CidrCount, Is.EqualTo(4));
+            CollectionAssert.AreEqual(
+                new[] { "idea64", "rider64", "rdcman", "mstsc" },
+                fake.CidrProcesses);
+            CollectionAssert.AreEqual(
+                new[] { "192.168.100.0/24", "192.168.100.0/24", "192.168.100.0/24", "192.168.100.0/24" },
+                fake.CidrValues);
+        }
+
+        [Test]
+        public void RuleWithoutDestinationRangesProducesNoCidrCalls()
+        {
+            var fake = new FakeProxyEngine(new IntPtr(1));
+            new ProxyRuleRegistrationCoordinator().Register(
+                new List<ProxyRule> {
+                    new ProxyRule {
+                        Socks5ProxyEndpoint = "127.0.0.1:1080",
+                        AppNames = new List<string> { "mstsc" }
+                    }
+                }, fake, null, null, null);
+
+            Assert.That(fake.CidrCount, Is.EqualTo(0));
+        }
+
+        [Test]
         public void RegistrationCoordinatorDoesNotUseInvalidHandlesOrPartialCredentials()
         {
             var partial = new ProxyRule
@@ -229,6 +267,8 @@ namespace ProxiFyre.Tests
             public int AddCount { get; private set; }
             public int AssociationCount { get; private set; }
             public int CidrCount { get; private set; }
+            public readonly List<string> CidrProcesses = new List<string>();
+            public readonly List<string> CidrValues = new List<string>();
 
             public FakeProxyEngine(IntPtr result) { _result = result; }
 
@@ -247,6 +287,8 @@ namespace ProxiFyre.Tests
             public bool IncludeProcessDestinationCidr(string processName, string cidr)
             {
                 CidrCount++;
+                CidrProcesses.Add(processName);
+                CidrValues.Add(cidr);
                 return true;
             }
 

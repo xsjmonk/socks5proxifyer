@@ -74,6 +74,7 @@ namespace ProxiFyre.Configuration
                 TlsAllowInvalidCertificate = rule.TlsAllowInvalidCertificate,
                 SupportedProtocols = CanonicalizeList(rule.SupportedProtocols, new[] { "TCP", "UDP" }),
                 SupportedAddressFamilies = CanonicalizeList(rule.SupportedAddressFamilies, new[] { "IPv4", "IPv6" }),
+                IpRanges = ProxyRuleDestinationRangePolicy.Copy(rule.IpRanges),
                 ExtensionData = CloneExtensionData(rule.ExtensionData)
             };
         }

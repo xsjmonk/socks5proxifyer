@@ -72,6 +72,7 @@
     <Compile Include="ConfigurationNormalizer.cs" />
     <Compile Include="ConfigurationSerializer.cs" />
     <Compile Include="ConfigurationValidator.cs" />
+    <Compile Include="ProxyRuleDestinationRangePolicy.cs" />
     <Compile Include="ProxyRuleRegistration.cs" />
     <Compile Include="UiLogBuffer.cs" />
     <Compile Include="ConfigurationValueParser.cs" />

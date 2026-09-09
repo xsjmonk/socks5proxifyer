@@ -1,6 +1,7 @@
 using Newtonsoft.Json.Linq;
 using NUnit.Framework;
 using ProxiFyre.Configuration;
+using System.Linq;
 using System.Collections.Generic;
 
 namespace ProxiFyre.Tests
@@ -46,6 +47,32 @@ namespace ProxiFyre.Tests
             Assert.That((int)normalized.ExtensionData["future"]["x"], Is.EqualTo(1));
             Assert.That((int)normalized.Proxies[0].ExtensionData["next"], Is.EqualTo(42));
             Assert.That(configuration.Proxies[0].AppNames.Count, Is.EqualTo(5), "The source must not be mutated.");
+        }
+
+        [Test]
+        public void NormalizePreservesDestinationRangesAndNullSemantics()
+        {
+            var rule = TestModels.ValidRule();
+            rule.IpRanges = new List<string> { "192.168.100.0/24" };
+            var normalized = _normalizer.NormalizeRule(rule);
+
+            CollectionAssert.AreEqual(rule.IpRanges, normalized.IpRanges);
+            Assert.That(normalized.IpRanges, Is.Not.SameAs(rule.IpRanges));
+            Assert.That(_normalizer.NormalizeRule(TestModels.ValidRule()).IpRanges, Is.Null);
+        }
+
+        [Test]
+        public void JsonValidationAndNormalizationPreserveConfiguredDestinationRanges()
+        {
+            var json = "{\"proxies\":[{\"appNames\":[\"rdcman\"],\"socks5ProxyEndpoint\":\"127.0.0.1:1080\",\"ipRanges\":[\"192.168.100.0/24\"]}]}";
+            var configuration = new ConfigurationSerializer().Deserialize(json);
+
+            Assert.That(new ConfigurationValidator().Validate(configuration).IsValid, Is.True);
+            var normalized = _normalizer.Normalize(configuration);
+
+            CollectionAssert.AreEqual(
+                new[] { "192.168.100.0/24" },
+                normalized.Proxies.Single().IpRanges);
         }
 
         [Test]
