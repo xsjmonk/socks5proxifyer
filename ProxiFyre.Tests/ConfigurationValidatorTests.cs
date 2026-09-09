@@ -296,6 +296,30 @@ namespace ProxiFyre.Tests
             Assert.That(result.IsValid, Is.True);
         }
 
+        [TestCase("0.0.0.0/0")]
+        [TestCase("192.168.100.0/24")]
+        [TestCase("255.255.255.255/32")]
+        public void ValidDestinationRangesAreAccepted(string cidr)
+        {
+            var rule = TestModels.ValidRule();
+            rule.IpRanges = new List<string> { cidr };
+
+            Assert.That(_validator.ValidateRule(rule).IsValid, Is.True);
+        }
+
+        [TestCase("192.168.100.0")]
+        [TestCase("192.168.100.0/33")]
+        [TestCase("192.168.100.0/-1")]
+        [TestCase("2001:db8::/32")]
+        [TestCase("not-an-ip/24")]
+        public void InvalidDestinationRangesProduceDiagnostics(string cidr)
+        {
+            var rule = TestModels.ValidRule();
+            rule.IpRanges = new List<string> { cidr };
+
+            HasIssue(_validator.ValidateRule(rule), "IP_RANGE_INVALID", ValidationSeverity.Error);
+        }
+
         private static void HasIssue(ValidationResult result, string code, ValidationSeverity severity)
         {
             Assert.That(

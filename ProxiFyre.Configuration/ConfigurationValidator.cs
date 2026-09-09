@@ -178,9 +178,33 @@ namespace ProxiFyre.Configuration
                 issues);
 
             ValidateApplications(rule.AppNames, prefix, index, issues);
+            ValidateDestinationRanges(rule.IpRanges, prefix, index, issues);
             ValidateProtocols(rule.SupportedProtocols, prefix, index, issues);
             ValidateAddressFamilies(rule.SupportedAddressFamilies, prefix, index, issues);
             ValidateTransportAndTls(rule, prefix, index, issues);
+        }
+
+        private static void ValidateDestinationRanges(
+            IList<string> ipRanges,
+            string prefix,
+            int? ruleIndex,
+            ICollection<ValidationIssue> issues)
+        {
+            if (ipRanges == null)
+                return;
+
+            for (var rangeIndex = 0; rangeIndex < ipRanges.Count; rangeIndex++)
+            {
+                string reason;
+                if (!ProxyRuleDestinationRangePolicy.TryValidate(ipRanges[rangeIndex], out reason))
+                {
+                    issues.Add(Error(
+                        "IP_RANGE_INVALID",
+                        "The destination range " + reason + ".",
+                        prefix + ".ipRanges[" + rangeIndex + "]",
+                        ruleIndex));
+                }
+            }
         }
 
         private static void ValidateCredentialLength(

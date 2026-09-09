@@ -149,6 +149,36 @@ namespace ProxiFyre.Tests
         }
 
         [Test]
+        public void RejectedDestinationRangeWarnsAndContinuesRegistration()
+        {
+            var fake = new FakeProxyEngine(new IntPtr(1), true);
+            var warnings = new List<string>();
+            var rules = new List<ProxyRule>
+            {
+                new ProxyRule {
+                    Socks5ProxyEndpoint = "127.0.0.1:1080",
+                    AppNames = new List<string> { "first" },
+                    IpRanges = new List<string> { "192.168.100.0/24", "10.0.0.0/8" }
+                },
+                new ProxyRule {
+                    Socks5ProxyEndpoint = "127.0.0.1:1081",
+                    AppNames = new List<string> { "later" },
+                    IpRanges = new List<string> { "172.16.0.0/12" }
+                }
+            };
+
+            new ProxyRuleRegistrationCoordinator().Register(
+                rules, fake, null, (index, message) => warnings.Add(message), null);
+
+            Assert.That(fake.CidrCount, Is.EqualTo(3));
+            Assert.That(fake.AssociationCount, Is.EqualTo(2));
+            Assert.That(warnings.Count, Is.EqualTo(3));
+            StringAssert.Contains("rule 1", warnings[0]);
+            StringAssert.Contains("first", warnings[0]);
+            StringAssert.Contains("192.168.100.0/24", warnings[0]);
+        }
+
+        [Test]
         public void RegistrationCoordinatorDoesNotUseInvalidHandlesOrPartialCredentials()
         {
             var partial = new ProxyRule
@@ -264,6 +294,7 @@ namespace ProxiFyre.Tests
         private sealed class FakeProxyEngine : IProxyEngineBoundary
         {
             private readonly IntPtr _result;
+            private readonly bool _rejectCidrs;
             public int AddCount { get; private set; }
             public int AssociationCount { get; private set; }
             public int CidrCount { get; private set; }
@@ -271,6 +302,11 @@ namespace ProxiFyre.Tests
             public readonly List<string> CidrValues = new List<string>();
 
             public FakeProxyEngine(IntPtr result) { _result = result; }
+            public FakeProxyEngine(IntPtr result, bool rejectCidrs)
+            {
+                _result = result;
+                _rejectCidrs = rejectCidrs;
+            }
 
             public IntPtr AddSocks5Proxy(NativeProxyRuleSettings settings)
             {
@@ -289,7 +325,7 @@ namespace ProxiFyre.Tests
                 CidrCount++;
                 CidrProcesses.Add(processName);
                 CidrValues.Add(cidr);
-                return true;
+                return !_rejectCidrs;
             }
 
             public bool ExcludeProcessName(string processName) { return true; }

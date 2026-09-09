@@ -116,6 +116,10 @@ namespace ProxiFyre.Configuration
                     {
                         if (engine.IncludeProcessDestinationCidr(appName, cidr))
                             information?.Invoke(index, "added CIDR " + cidr + " for " + appName);
+                        else
+                            warning?.Invoke(
+                                index,
+                                "rule " + (index + 1) + " rejected CIDR " + cidr + " for process " + appName);
                     }
                 }
             }
