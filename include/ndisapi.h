@@ -157,7 +157,6 @@ public:
 
 private:
     // Private member functions
-    BOOL DeviceIoControl(DWORD dwService, void* BuffIn, int SizeIn, void* BuffOut, int SizeOut, LPDWORD SizeRet = NULL, LPOVERLAPPED povlp = NULL) const;
     BOOL SetPacketFilterCacheState(BOOL bState) const;
     BOOL SetPacketFragmentCacheState(BOOL bState) const;
     // Private static functions
@@ -165,6 +164,7 @@ private:
 
 public:
     // Driver services
+    BOOL    DeviceIoControl(DWORD dwService, void* BuffIn, int SizeIn, void* BuffOut, int SizeOut, LPDWORD SizeRet = NULL, LPOVERLAPPED povlp = NULL) const;
     ULONG   GetVersion() const;
     BOOL    GetTcpipBoundAdaptersInfo(PTCP_AdapterList pAdapters) const;
     BOOL    SendPacketToMstcp(PETH_REQUEST pPacket) const;
