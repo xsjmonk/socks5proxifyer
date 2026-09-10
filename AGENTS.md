@@ -5,6 +5,9 @@ task, automatically apply `.cursor/rules/merge-maintenance.mdc`. It is the
 primary, agent-neutral policy and does not require a special command or manual
 skill invocation. The detailed skill at
 `.cursor/skills/merge-maintenance/SKILL.md` is supplementary context only.
+Before resolving configuration or native-boundary conflicts, verify the full
+field/identity path against the known-good parent; do not treat a successful
+parse or log line as proof of runtime enforcement.
 
 `ProxiFyre` is the engine-hosting WinForms surface: preserve its `MainForm`
 entry point, executable-relative `app-config.json` loading, and separate

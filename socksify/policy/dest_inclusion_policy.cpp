@@ -8,8 +8,8 @@
 #pragma comment(lib, "Ws2_32.lib")
 
 #include "policy/dest_inclusion_policy.h"
+#include "policy/process_key.h"
 
-#include <cwctype>     // towlower
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
@@ -19,26 +19,12 @@
 #include <cstdlib>     // atoi
 
 namespace {
+    using dip_policy::normalize_process_key;
+
     struct CidrV4 {
         uint32_t network; // host order
         uint32_t mask;    // host order
     };
-
-    // lower-case exe name ("chrome.exe")
-    std::wstring to_lower(const std::wstring& s) {
-        std::wstring r(s);
-        std::transform(r.begin(), r.end(), r.begin(), [](wchar_t c){
-            return static_cast<wchar_t>(::towlower(static_cast<wint_t>(c)));
-        });
-        return r;
-    }
-
-    // keep only the file name (no path)
-    std::wstring basename_exe(const std::wstring& full) {
-        size_t p = full.find_last_of(L"\\/"); 
-        if (p == std::wstring::npos) return to_lower(full);
-        return to_lower(full.substr(p + 1));
-    }
 
     bool parse_cidr_v4(const char* cidr, CidrV4& out) {
         if (!cidr || !*cidr) return false;
@@ -77,7 +63,7 @@ namespace {
 
     struct PolicyStore {
         std::mutex m;
-        std::unordered_map<std::wstring, std::vector<CidrV4>> by_proc; // key: "chrome.exe"
+        std::unordered_map<std::wstring, std::vector<CidrV4>> by_proc; // key: canonical process name
         std::vector<CidrV4> globals;
 
         bool add_proc(const std::wstring& exe, const char* cidr) {
@@ -139,7 +125,7 @@ namespace {
 
             // Per-process rules
             if (process_name_or_null && *process_name_or_null) {
-                auto key = basename_exe(process_name_or_null);
+                auto key = normalize_process_key(process_name_or_null);
                 auto it = by_proc.find(key);
                 if (it != by_proc.end()) {
                     // match => redirect, no match => passthrough
@@ -162,12 +148,12 @@ namespace {
 
 int DIP_CALL dip_add_process(const wchar_t* process_name, const char* cidr) {
     if (!process_name || !cidr) return 0;
-    return store().add_proc(basename_exe(process_name), cidr) ? 1 : 0;
+    return store().add_proc(normalize_process_key(process_name), cidr) ? 1 : 0;
 }
 
 int DIP_CALL dip_remove_process(const wchar_t* process_name, const char* cidr) {
     if (!process_name || !cidr) return 0;
-    return store().rem_proc(basename_exe(process_name), cidr) ? 1 : 0;
+    return store().rem_proc(normalize_process_key(process_name), cidr) ? 1 : 0;
 }
 
 int DIP_CALL dip_add_global(const char* cidr) {

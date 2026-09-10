@@ -35,6 +35,12 @@ Every new or merged node needs a round-trip or end-to-end pipeline test covering
 populated and omitted/null semantics where meaningful, using the product's
 actual configuration shape rather than only a directly instantiated model.
 
+For native or cross-process behavior, inventory the identity contract as well:
+record how values are normalized when registered and when looked up. Check
+paths, basename extraction, case, executable extensions, handles, indexes, and
+serialized names. A policy store that accepts one spelling but looks up another
+is a merge regression even when registration logs are correct.
+
 ## Non-negotiable product behavior
 
 - `ProxiFyre` is the engine-hosting WinForms surface. Its `Program.cs` owns
@@ -88,6 +94,13 @@ large file, extract a coordinator, adapter, or helper with a stable interface;
 do not repeatedly grow the hotspot. Keep compatibility shims at module
 boundaries and put new behavior in the owning module.
 
+Prefer a new narrow helper or adapter for merge-specific behavior when it can
+reduce edits to an upstream hotspot. Keep the integration seam explicit and
+small. Do not move a concern merely to avoid a conflict if that would duplicate
+ownership or weaken the existing public contract. Project and solution metadata
+are part of the conflict surface: include each file once, and keep standalone
+tests outside the main solution when they do not need solution-level wiring.
+
 Preserve configuration schema, property casing, normalization, validation,
 first-match ordering, and unknown-field compatibility. Keep stable public APIs
 and use narrow interfaces, adapters, or overloads at cross-module seams.
@@ -121,6 +134,12 @@ Known hotspots and preferred seams:
 8. Search the repository for conflict markers, duplicate type names, stale file includes, TODOs, placeholder success responses, and calls using invalid handles.
 9. Build the affected project, then the solution. Run focused tests and a UI/runtime smoke check when the environment supports them.
 10. Review the final diff by module. Leave generated output unstaged and report any runtime or driver limitation honestly.
+
+For a regression, add a causal proof before declaring the merge resolved:
+identify the first layer that diverges from the known-good parent, add a test at
+that layer, and add one end-to-end check across the affected boundary. Do not
+accept a log-only proof when the behavior is enforced by native code, a driver,
+or a deployed artifact.
 
 ## Required invariants
 
@@ -190,6 +209,12 @@ recoverable and request a decision when behavior cannot be inferred safely.
   independent of the visible pane.
 - Do not run broad formatting or generated-file rewrites while resolving a merge; they increase future conflict surface.
 - Do not change installer/service behavior merely to make an interactive UI build pass.
+- Do not assume a field is supported because it exists in a model or startup
+  log; normalization, cloning, adapters, native key lookup, and deployed
+  artifact selection can still discard or bypass it.
+- Do not normalize registration names and lookup names independently. Reuse one
+  canonical helper, especially for process names, paths, extensions, casing,
+  handles, and serialized identifiers.
 
 ## Completion gate
 

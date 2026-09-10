@@ -13,6 +13,9 @@ Before editing:
 - inspect repository instructions, `git status`, merge base, both parents,
   changed/unmerged paths, affected projects, and the surrounding call graph;
 - classify each conflict by module ownership and understand both sides;
+- for configuration or cross-boundary behavior, inventory each field from JSON
+  through model, validation, normalization/clone, runtime consumer, and native
+  or UI boundary; compare that path with the known-good parent;
 - never choose wholesale ours/theirs for a large file.
 
 Design and resolution principles:
@@ -26,6 +29,12 @@ Design and resolution principles:
 - resolve the first causal failure, not a downstream symptom;
 - preserve every configuration field through deserialize, validate,
   normalize/clone, and its runtime or UI consumer;
+- preserve identity normalization at boundaries: names, paths, casing,
+  extensions, handles, indexes, and serialized property names must use one
+  canonical contract at both registration and lookup;
+- prove behavior at the layer where the regression occurs; source/model tests
+  do not prove native packet enforcement, and a successful build does not prove
+  the selected deployed artifact;
 - review the final diff by module and remove markers, duplicate types,
   duplicate implementations, stale references, placeholders, and generated
   output.
@@ -97,6 +106,8 @@ Completion checklist:
 - run focused tests and executable/UI smoke tests when Windows supports them;
 - verify final runtime artifacts when output/deployment paths changed;
 - record exact native, driver, installer, and runtime limitations;
+- document whether every changed field and cross-boundary identity has a
+  populated, omitted/null, and end-to-end regression test where applicable;
 - report changed modules, checks, unresolved risks, and remaining hotspots.
 
 Common traps: compilation without UI/runtime validation; stale or mismatched

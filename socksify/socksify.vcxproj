@@ -284,6 +284,7 @@
     <ClInclude Include="logger.h" />
     <ClInclude Include="mixed_types.h" />
     <ClInclude Include="policy\dest_inclusion_policy.h" />
+    <ClInclude Include="policy\process_key.h" />
     <ClInclude Include="Socksifier.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="Resource.h" />
