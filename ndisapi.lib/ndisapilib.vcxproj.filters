@@ -30,6 +30,9 @@
     <ClInclude Include="..\ndisapi\resource.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="..\ndisapi\inet_checksum.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\ndisapi\ndisapi.cpp">
