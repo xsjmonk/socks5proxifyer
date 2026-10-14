@@ -17,8 +17,18 @@ namespace ProxiFyre
     public sealed class ProxiFyreService
     {
         private static readonly Logger LoggerInstance = LogManager.GetCurrentClassLogger();
+        private readonly bool _useLimitedMode;
         private Socksifier.Socksifier _socksify;
         private SocksifierLogLevel _logLevel;
+
+        public ProxiFyreService() : this(false)
+        {
+        }
+
+        internal ProxiFyreService(bool useLimitedMode)
+        {
+            _useLimitedMode = useLimitedMode;
+        }
 
         public void Start()
         {
@@ -30,12 +40,30 @@ namespace ProxiFyre
             if (File.Exists(logConfigFilePath))
                 LogManager.Configuration = new XmlLoggingConfiguration(logConfigFilePath);
 
+            if (_useLimitedMode)
+                LoggerInstance.Warn(Program.LimitedModeWarning);
+
             ArtifactIdentity.Log(LoggerInstance, configFilePath);
             var settings = LoadConfiguration(configFilePath);
             _logLevel = MapLogLevel(ConfigurationValueParser.GetLogLevel(settings.LogLevel));
             ConfigureManagedLogLevel(_logLevel);
 
-            _socksify = Socksifier.Socksifier.GetInstance(_logLevel);
+            try
+            {
+                _socksify = Socksifier.Socksifier.GetInstance(_logLevel, _useLimitedMode);
+            }
+            catch (Exception ex)
+            {
+                var message = _useLimitedMode
+                    ? "Failed to initialize the ProxiFyre proxy engine in non-administrator mode. " +
+                      "Ensure the Windows Packet Filter (NDISRD) driver is installed and that this " +
+                      "Windows account is permitted to open the driver, then retry."
+                    : "Failed to initialize the ProxiFyre proxy engine. Ensure the Windows Packet Filter " +
+                      "(NDISRD) driver is installed and available, then restart the service.";
+                LoggerInstance.Error(ex, message);
+                throw new InvalidOperationException(message, ex);
+            }
+
             _socksify.LogEvent += LogPrinter;
             _socksify.LogLimit = 100;
             _socksify.LogEventInterval = 1000;
@@ -86,10 +114,20 @@ namespace ProxiFyre
                 _socksify.ExcludeProcessName(excludedEntry);
 
             if (!_socksify.Start())
-                throw new InvalidOperationException(
-                    "The ProxiFyre native router could not be started.");
+            {
+                var message = _useLimitedMode
+                    ? "Failed to start the ProxiFyre proxy engine in non-administrator mode. " +
+                      "Ensure the Windows Packet Filter (NDISRD) driver is installed and running and " +
+                      "that this Windows account is permitted to activate it, or retry from an " +
+                      "Administrator console."
+                    : "Failed to start the ProxiFyre proxy engine. Ensure the Windows Packet Filter " +
+                      "(NDIS lightweight filter) driver is installed and running, then restart the service.";
+                LoggerInstance.Error(message);
+                throw new InvalidOperationException(message);
+            }
 
-            LoggerInstance.Info("ProxiFyre Service is running...");
+            if (_logLevel >= SocksifierLogLevel.Info)
+                LoggerInstance.Info("ProxiFyre Service is running...");
         }
 
         public void Stop()

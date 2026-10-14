@@ -240,6 +240,115 @@ function Get-SolutionProjectDirectories {
     }
 }
 
+function Test-RepositorySubpath {
+    param(
+        [string]$RepositoryRoot,
+        [string]$CandidatePath
+    )
+
+    $rootFull = [IO.Path]::GetFullPath($RepositoryRoot)
+    $candidateFull = [IO.Path]::GetFullPath($CandidatePath)
+    if ($candidateFull.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+
+    $prefix = $rootFull + [IO.Path]::DirectorySeparatorChar
+    return $candidateFull.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-SolutionPlatformNames {
+    param([string]$SolutionPath)
+
+    $platforms = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($line in Get-Content -LiteralPath $SolutionPath) {
+        if ($line -match '^\s*(?:Debug|Release)\|([^=]+)\s*=') {
+            $null = $platforms.Add($Matches[1].Trim())
+        }
+    }
+
+    return @($platforms)
+}
+
+function Get-ProjectPlatformDirectoryNames {
+    param([string]$SolutionPlatformName)
+
+    if ($SolutionPlatformName -eq "x86") {
+        return @("x86", "Win32")
+    }
+
+    return @($SolutionPlatformName)
+}
+
+function Get-RepositoryObjDirectories {
+    param([string]$RepositoryRoot)
+
+    $skipDirectoryNames = [System.Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase,
+        @("Build", "Build.staging", "packages", ".git", "vcpkg_installed", "node_modules"))
+
+    $objDirectories = [System.Collections.Generic.List[string]]::new()
+    $pending = [System.Collections.Queue]::new()
+    $pending.Enqueue([IO.Path]::GetFullPath($RepositoryRoot))
+
+    while ($pending.Count -gt 0) {
+        $currentDirectory = [string]$pending.Dequeue()
+        foreach ($child in Get-ChildItem -LiteralPath $currentDirectory -Directory -ErrorAction SilentlyContinue) {
+            if ($skipDirectoryNames.Contains($child.Name)) {
+                continue
+            }
+
+            if ($child.Name -eq "obj") {
+                $objDirectories.Add($child.FullName)
+                continue
+            }
+
+            $pending.Enqueue($child.FullName)
+        }
+    }
+
+    return $objDirectories
+}
+
+function Get-IntermediateCleanupTargets {
+    param(
+        [string]$RepositoryRoot,
+        [string]$SolutionPath
+    )
+
+    $targets = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $null = $targets.Add((Join-Path $RepositoryRoot "bin"))
+
+    foreach ($objDirectory in Get-RepositoryObjDirectories -RepositoryRoot $RepositoryRoot) {
+        $null = $targets.Add($objDirectory)
+    }
+
+    $platformNames = Get-SolutionPlatformNames -SolutionPath $SolutionPath
+    foreach ($projectDirectory in Get-SolutionProjectDirectories -SolutionPath $SolutionPath) {
+        foreach ($platformName in $platformNames) {
+            foreach ($directoryName in Get-ProjectPlatformDirectoryNames -SolutionPlatformName $platformName) {
+                $null = $targets.Add((Join-Path $projectDirectory $directoryName))
+            }
+        }
+    }
+
+    return @($targets)
+}
+
+function Remove-IntermediateBuildOutputs {
+    param(
+        [string]$RepositoryRoot,
+        [string]$SolutionPath
+    )
+
+    foreach ($target in Get-IntermediateCleanupTargets -RepositoryRoot $RepositoryRoot -SolutionPath $SolutionPath) {
+        if (-not (Test-RepositorySubpath -RepositoryRoot $RepositoryRoot -CandidatePath $target)) {
+            throw "Refusing to delete path outside the repository: $target"
+        }
+
+        Remove-IfExists $target
+    }
+}
+
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $solution = Join-Path $root "socksify.sln"
 $buildDir = Join-Path $root "Build"
@@ -287,25 +396,15 @@ if (-not [string]::IsNullOrWhiteSpace($ConfigurationPath)) {
 Write-ArtifactManifest -DeploymentDirectory (Join-Path $stagingDir "exe") `
     -ConfigurationName $Configuration -PlatformName $Platform
 
-Write-Info "Removing intermediate and original output folders"
-$cleanupTargets = [System.Collections.Generic.List[string]]::new()
-$cleanupTargets.Add((Join-Path $root "bin"))
-
-foreach ($projectDirectory in Get-SolutionProjectDirectories -SolutionPath $solution) {
-    $cleanupTargets.Add((Join-Path $projectDirectory "obj"))
-    $cleanupTargets.Add((Join-Path $projectDirectory $Platform))
-}
-
-foreach ($target in ($cleanupTargets | Select-Object -Unique)) {
-    Remove-IfExists $target
-}
-
 Write-Info "Deleting PDB and EXP files from Build folder"
 Get-ChildItem -Path $stagingDir -Include *.pdb,*.exp -Recurse -File | Remove-Item -Force
 
 Write-Info "Publishing complete artifact set"
 Remove-IfExists $buildDir
 Move-Item -LiteralPath $stagingDir -Destination $buildDir
+
+Write-Info "Removing intermediate build outputs"
+Remove-IntermediateBuildOutputs -RepositoryRoot $root -SolutionPath $solution
 
 Write-Info "Build completed successfully"
 Write-Info "Artifacts: $buildDir"
