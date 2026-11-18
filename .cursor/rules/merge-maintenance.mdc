@@ -39,6 +39,10 @@ Design and resolution principles:
   duplicate implementations, stale references, placeholders, and generated
   output.
 
+README policy: `README.md` is always the fork's own version. Never take the
+upstream (`wiresock/proxifyre`) README during a merge; keep our side on conflict
+and verify `git diff HEAD -- README.md` shows no changes afterwards.
+
 ProxiFyre invariants:
 - `ProxiFyre/Program.cs` has one WinForms `Main` that launches `MainForm`;
 - `ProxiFyre` is the engine-hosting WinForms surface: `MainForm` owns its UI

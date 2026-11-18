@@ -141,6 +141,22 @@ that layer, and add one end-to-end check across the affected boundary. Do not
 accept a log-only proof when the behavior is enforced by native code, a driver,
 or a deployed artifact.
 
+## README policy
+
+`README.md` is always the fork's own version. During any merge, rebase,
+cherry-pick, or conflict resolution, keep our side and never take the upstream
+(`wiresock/proxifyre`) text:
+
+- On conflict, resolve `README.md` with `git checkout --ours -- README.md`
+  (or the equivalent `ours` side for the current branch), then `git add`.
+- Never accept upstream README changes, even when the merge is otherwise clean.
+  If a merge would change it, restore the fork version afterwards and verify
+  with `git diff HEAD -- README.md` (expected: no changes).
+- Do not edit README content as part of a merge. Documentation changes belong in
+  a separate, explicitly requested commit.
+- The current fork version is the one committed in `d2a4771` ("Revert readme")
+  on `merge/1118`. Treat that as the baseline until the owner changes it.
+
 ## Required invariants
 
 - UI startup remains a WinForms `WinExe`; `Program.Main` launches `MainForm`.
