@@ -61,9 +61,9 @@ Windows Packet Filter and the architecture-matched Visual C++ runtime are target
    ```
    - Takes: 2-5 minutes. Set timeout to 10+ minutes.
 
-2. **Build the solution**. `Directory.Build.props` is the single repository release-version source and currently declares `2.6.4`; normal local builds inherit it. An explicit version is appropriate for release verification and controlled tests, but it must match the repository value for a release:
+2. **Build the solution**. `Directory.Build.props` is the single repository release-version source and currently declares `2.7.0`; normal local builds inherit it. An explicit version is appropriate for release verification and controlled tests, but it must match the repository value for a release:
    ```cmd
-   msbuild socksify.sln -t:rebuild -verbosity:minimal -property:Configuration=Release -property:Platform=x64 -property:Version=2.6.4
+   msbuild socksify.sln -t:rebuild -verbosity:minimal -property:Configuration=Release -property:Platform=x64 -property:Version=2.7.0
    ```
    - **NEVER CANCEL**: Build takes 5-8 minutes on average. Set timeout to 15+ minutes.
    - For other platforms, replace `x64` with `x86` or `ARM64`
@@ -77,9 +77,9 @@ Windows Packet Filter and the architecture-matched Visual C++ runtime are target
 
 4. **Build and validate the MSI and online setup** after the isolated restores and solution build:
    ```powershell
-   pwsh -File scripts\Build-Installer.ps1 -Platform x64 -Version 2.6.4 -NoRestore
+   pwsh -File scripts\Build-Installer.ps1 -Platform x64 -Version 2.7.0 -NoRestore
    ```
-   The release tag must be exactly `v2.6.4` when `Directory.Build.props` declares `2.6.4`.
+   The release tag must be exactly `v2.7.0` when `Directory.Build.props` declares `2.7.0`.
 
 ## Running the Application (Windows Only)
 
@@ -227,8 +227,8 @@ Create this file in the same directory as `ProxiFyre.exe`:
 - `.github/workflows/main.yml`: CI/CD build pipeline
 
 ### Include Directories
-- `./include/`: Common headers (`Common.h`, `ndisapi.h`)
-- `./ndisapi/`: NDIS API implementation
+- `./external/ndisapi/`: Git submodule of [wiresock/ndisapi](https://github.com/wiresock/ndisapi) (Windows Packet Filter user-mode API). `include/` holds `Common.h` and `ndisapi.h`; `ndisapi/` holds the implementation. Run `git submodule update --init` after cloning.
+- `./ndisapi.lib/`: ProxiFyre's static-library project that builds the submodule sources with the solution's CRT settings
 - `./netlib/`: Network utility C++ classes
 
 ## Common Tasks
@@ -237,7 +237,7 @@ Create this file in the same directory as `ProxiFyre.exe`:
 ```bash
 # Root directory listing
 ls -la
-# Output includes the engine, managed UI, native launcher, tests, MSI, bundle, both setup helpers, socksify, ndisapi.lib, include, netlib, scripts, docs, README.md, and socksify.sln
+# Output includes the engine, managed UI, native launcher, tests, MSI, bundle, both setup helpers, socksify, ndisapi.lib, external (ndisapi submodule), netlib, scripts, docs, README.md, and socksify.sln
 
 # Key configuration files
 find . -name "*.json" -o -name "*.config" -o -name "packages.config"
@@ -256,7 +256,7 @@ find . -name "*.cs"
 
 # Find C++ files  
 find . -name "*.cpp" -o -name "*.h"
-# Output: socksify/ and ndisapi/ directories contain C++ implementation
+# Output: socksify/, netlib/ and the external/ndisapi/ submodule contain C++ implementation
 ```
 
 ## Limitations

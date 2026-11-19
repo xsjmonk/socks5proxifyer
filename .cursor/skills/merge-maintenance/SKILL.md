@@ -232,6 +232,133 @@ recoverable and request a decision when behavior cannot be inferred safely.
   canonical helper, especially for process names, paths, extensions, casing,
   handles, and serialized identifiers.
 
+## GUI authority
+
+The fork's GUI is authoritative. Upstream (`upstream/main`) contributes
+libraries only (for example `netlib`, `ndisapi`, and vcpkg/NuGet packages).
+Never take upstream UI or entry-point code. Fork-owned paths that must match the
+fork (`origin/main`) after every merge unless the owner changes them:
+
+- `ProxiFyre/Program.cs`, `ProxiFyre/MainForm.cs`, `ProxiFyre/NLog.config`,
+  `ProxiFyre/MainForm.Designer.cs`, `ProxiFyre/ProxiFyreService.cs`,
+  `ProxiFyre/ArtifactIdentity.cs`, `ProxiFyre/ConsoleTextWriter.cs`,
+  `ProxiFyre/NativeDependencyLoader.cs`, `ProxiFyre/ProxiFyre.csproj`,
+  `ProxiFyre/app.ico`;
+- `ProxiFyreUI/**` and `ProxiFyreUILauncher/**`.
+
+Upstream differs here: its `ProxiFyre/Program.cs` is a console Topshelf `Exe`
+targeting .NET Framework 4.7.2, and its `ProxiFyreUI/Forms/MainForm.cs` is not
+the fork's. Verify after resolving with blob equality:
+
+```
+git rev-parse HEAD:ProxiFyre/Program.cs origin/main:ProxiFyre/Program.cs
+```
+
+If the GUI blobs differ from `origin/main`, the GUI leaked from upstream. Restore
+the fork's files (`git checkout origin/main -- <path>`) and re-check the native
+or library changes separately.
+
+### Engine window logging (NLog console target)
+
+The engine's own WinForms window (`ProxiFyre/MainForm.cs`, launched by
+`Program.RunEngineWinForms`) shows only what is written to `Console.Out` and
+`Console.Error`. It does not read the log file. The redirection is
+`Console.SetOut(new MultiTextWriter(...))` in `Program.cs`.
+
+So `ProxiFyre/NLog.config` must keep a console target and send `Info` and above
+to it. The correct setting is:
+
+- a `Console` target (`name="console"`) with the layout
+  `${longdate}|${uppercase:${level}}|${logger}|${message}${exception:format=ToString}`;
+- `<logger name="*" minlevel="Info" writeTo="file,console" />`.
+
+Upstream's `NLog.config` (commit `ed9213e`, 2026-10-13) removed the console
+target. A clean auto-merge took it with no conflict, so the engine window showed
+only its own startup lines and the service log never appeared. Because this is
+not a conflict, the merge tooling does not flag it. After every merge, check
+`ProxiFyre/NLog.config` against this rule, and do not accept upstream's version.
+## Feature contract (README)
+
+`README.md` (fork version) lists user-visible features. Each one is a merge
+contract. After a merge, verify each feature has code, a test, and a build path:
+
+- `ipRanges` (per-rule destination CIDR): JSON model, normalizer copy,
+  validator, registration, `Socksifier`, `socksify_unmanaged`, `dip_*` policy,
+  and `netlib` `redirect_decider` call sites;
+- `--allow-not-admin`: `EngineCommandLinePolicy` and its tests;
+- SOCKS5 over TLS, LAN bypass, excludes, log level, and the Windows GUI with
+  Apply & Restart.
+
+A feature missing from any layer is a regression even when the build passes.
+
+## Anti-patterns and best practices from real regressions
+
+Source: `1ff93d4..4b553b0` (fixes for the `Fix merge error` base commit).
+
+Anti-patterns that happened:
+
+1. **Field dropped in the normalizer.** The model had `IpRanges`, but
+   `ConfigurationNormalizer.NormalizeRule` did not copy it. The feature vanished
+   silently on normalize, and the GUI save path (`ConfigurationWorkspace` →
+   normalizer) would erase it. Best practice: a coverage check that every
+   `[JsonProperty]` model property is assigned in the normalizer, plus a JSON →
+   validate → normalize → runtime test (`ConfigurationNormalizerTests`,
+   `ProxiFyreServiceBootstrapTests`).
+2. **Boolean result ignored.** `if (engine.IncludeProcessDestinationCidr(...))
+   info(...)` had no `else`, so a rejected CIDR was never reported. Best practice:
+   check every managed/native return value and emit a warning with rule index,
+   process name, and value; continue registration for the other rules. Test with
+   a fake engine that rejects.
+3. **Validation gap.** Malformed CIDRs were accepted at config time. Best
+   practice: one parser shared by validation and copy
+   (`ProxyRuleDestinationRangePolicy.TryValidate`), with `IP_RANGE_INVALID`
+   diagnostics and tests for valid and invalid inputs. The native `dip_*` parser
+   must reject the same malformed inputs; keep a native test for that.
+4. **Hybrid entry point.** The base commit had a WinForms `Main()` that launches
+   `MainForm` next to a Topshelf `ServiceProgram` host. Two competing bootstraps
+   are a regression. Keep one `Main` (fork version) and let the service coordinator
+   own runtime bootstrap.
+5. **Upstream file taken for a conflict.** Upstream's console `Program.cs` and
+   `ProxiFyreUI/Forms/MainForm.cs` are not the fork's. Resolve GUI conflicts with
+   the fork version and verify by blob (see GUI authority).
+6. **Upstream netlib router taken wholesale.** Upstream `socks_local_router.h` has
+   no `redirect_decider` hook. Taking it silently disables `ipRanges` routing. For
+   `netlib`, keep the fork's hook and add only the narrow upstream fixes.
+7. **Documentation drift.** After the merge, `.github/copilot-instructions.md`
+   described ProxiFyre as a console app on .NET 4.7.2, while the csproj is a
+   `WinExe` on 4.8. Docs must match the project file in the same merge.
+8. **Weak checks.** The original `-VerifyConfigurationSchema` only confirmed that
+   `NormalizeRule` exists and that tests mention the serializer and normalizer.
+   It passed even when a field was missing. The script now parses every
+   `[JsonProperty]` model property per class and fails if the normalizer
+   initializer for that class does not assign it, or does not clone
+   `ExtensionData`. Still treat it as a static check: it does not prove the
+   runtime or GUI path, so keep the pipeline tests.
+
+9. **Silent auto-merge of a file the fork's window depends on.** Upstream removed
+   the console NLog target (`ed9213e`). The merge took it with no conflict, so
+   the engine window lost every service line. Best practice: list each fork-owned
+   file a UI depends on under GUI authority, and check it after the merge (see
+   "Engine window logging").
+
+Best practices to follow:
+
+- Clone rules through `ConfigurationSerializer.CloneRule` (JSON round trip), as
+  `ProxyRuleEditorForm.BuildCandidate` does. Do not rebuild a `ProxyRule`
+  field-by-field, because that drops fields the GUI does not show, such as
+  `ipRanges`.
+- Keep the native enforcement chain intact: `Socksifier.cpp` →
+  `socksify_unmanaged.cpp` → `dip_should_redirect_for` → `socks_local_router`
+  `redirect_decider_`. Check each link after a merge; a missing link is silent.
+- Keep the policy seam narrow: `socksify/policy/POLICY-INTEGRATION.md` names
+  the three `normalize_process_key` call sites that must survive a merge.
+- Keep generated and build output untracked (`external/`, `Build/`,
+  `socksify/socksify/` appeared as untracked in this repo). Do not stage them
+  during a merge.
+- Record which layer proved each fix: a test for the normalizer, a test for the
+  registration warning, and a native test for the `dip_*` parser. A build alone
+  proves none of them.
+
 ## Completion gate
 
 The merge is complete only when:

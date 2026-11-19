@@ -193,6 +193,52 @@ if ($VerifyConfigurationSchema) {
     } else {
         Pass "Configuration schema has model, normalization, and pipeline-test coverage"
     }
+
+    # Field-level coverage: every [JsonProperty] model property must be copied by the
+    # normalizer initializer for its class, and ExtensionData must be cloned there too.
+    $classMatches = @([regex]::Matches($models, '(?m)^\s*public\s+(?:sealed\s+)?class\s+(\w+)'))
+    $declaredProperties = 0
+    for ($classIndex = 0; $classIndex -lt $classMatches.Count; $classIndex++) {
+        $classMatch = $classMatches[$classIndex]
+        $className = $classMatch.Groups[1].Value
+        $blockStart = $classMatch.Index
+        $blockEnd = $models.Length
+        if ($classIndex + 1 -lt $classMatches.Count) { $blockEnd = $classMatches[$classIndex + 1].Index }
+        $classText = $models.Substring($blockStart, $blockEnd - $blockStart)
+
+        $properties = @([regex]::Matches($classText, '(?m)\[JsonProperty\("([^"]+)"[^\r\n]*\]\s*public\s+[^\r\n]*?\s(\w+)\s*\{'))
+        $declaredProperties += $properties.Count
+        if ($properties.Count -eq 0) { continue }
+
+        $initializer = [regex]::Match($normalizer, "new\s+$className\s*\{")
+        if (-not $initializer.Success) {
+            Fail "Normalizer has no initializer for model class $className"
+            continue
+        }
+        $initializerClose = [regex]::Match($normalizer.Substring($initializer.Index), '(?m)^\s*\};')
+        if (-not $initializerClose.Success) {
+            Fail "Unable to locate the normalizer initializer end for $className"
+            continue
+        }
+        $initializerText = $normalizer.Substring($initializer.Index, $initializerClose.Index + $initializerClose.Length)
+
+        foreach ($property in $properties) {
+            $jsonName = $property.Groups[1].Value
+            $propertyName = $property.Groups[2].Value
+            if ($initializerText -notmatch "(?<![\w.])$propertyName\s*=(?!=)") {
+                Fail "Normalizer does not copy $className.$propertyName (JSON '$jsonName')"
+            }
+        }
+        if ($classText -match '\[JsonExtensionData\]' -and $initializerText -notmatch '(?<![\w.])ExtensionData\s*=') {
+            Fail "Normalizer does not clone ExtensionData for $className"
+        }
+    }
+
+    $jsonAttributeCount = [regex]::Matches($models, '\[JsonProperty\(').Count
+    if ($declaredProperties -ne $jsonAttributeCount) {
+        Fail "Unrecognized [JsonProperty] declaration: $jsonAttributeCount attribute(s) but $declaredProperties parsed; update the coverage check"
+    }
+    if ($failures.Count -eq 0) { Pass "Every JSON model property is copied by the normalizer" }
 }
 
 if ($failures.Count -gt 0) {

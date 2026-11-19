@@ -47,9 +47,16 @@ ProxiFyre invariants:
 - `ProxiFyre/Program.cs` has one WinForms `Main` that launches `MainForm`;
 - `ProxiFyre` is the engine-hosting WinForms surface: `MainForm` owns its UI
   and the single `ProxiFyreService` owns runtime/network bootstrap;
+- GUI authority: the fork's GUI is authoritative. Upstream contributes
+  libraries only. Keep `ProxiFyre/Program.cs`, `ProxiFyre/MainForm*.cs`,
+  `ProxiFyre/ProxiFyreService.cs`, `ProxiFyreUI/**`, and `ProxiFyreUILauncher/**`
+  equal to `origin/main` after a merge unless the owner changes them; never
+  take upstream's console `Program.cs` or upstream UI forms;
 - `ProxiFyreUI` plus `ProxiFyreUILauncher` is the separate configuration and
   service-management surface; it edits configuration, controls the service,
   and must not load `socksify.dll`; both surfaces must remain functional;
+- `ipRanges` is a fork feature: keep its JSON model, normalizer copy, validator,
+  registration warning, native `dip_*` policy, and netlib `redirect_decider` hook;
 - UI and Topshelf use the same authoritative `ProxiFyreService`;
 - executable-relative `app-config.json`/`NLog.config`, JSON names/case,
   normalization, validation, and compatibility remain unchanged;

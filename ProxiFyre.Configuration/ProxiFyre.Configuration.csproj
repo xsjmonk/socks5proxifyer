@@ -76,6 +76,7 @@
     <Compile Include="ProxyRuleRegistration.cs" />
     <Compile Include="UiLogBuffer.cs" />
     <Compile Include="ConfigurationValueParser.cs" />
+    <Compile Include="DnsConfiguration.cs" />
     <Compile Include="EngineCommandLinePolicy.cs" />
     <Compile Include="EndpointParser.cs" />
     <Compile Include="LogMessageLevelParser.cs" />

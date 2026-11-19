@@ -21,6 +21,12 @@ namespace ProxiFyre.Configuration
         public IList<ProxyRegistrationFailure> Failures { get; } =
             new List<ProxyRegistrationFailure>();
 
+        /// <summary>
+        /// Native proxy handle of each configured rule, index-aligned with the rule list.
+        /// -1 marks a rule whose native proxy was not created (or was skipped).
+        /// </summary>
+        public IList<IntPtr> RuleHandles { get; } = new List<IntPtr>();
+
         public bool AllRequiredRulesRegistered
         {
             get { return Failures.Count == 0; }
@@ -77,6 +83,7 @@ namespace ProxiFyre.Configuration
 
             for (var index = 0; index < rules.Count; index++)
             {
+                result.RuleHandles.Add(new IntPtr(-1));
                 var rule = rules[index] ?? new ProxyRule();
                 var settings = CreateSettings(rule);
                 beforeAdd?.Invoke(index, settings);
@@ -106,6 +113,8 @@ namespace ProxiFyre.Configuration
                     warning?.Invoke(index, "native proxy creation failed; associations were skipped");
                     continue;
                 }
+
+                result.RuleHandles[index] = handle;
 
                 foreach (var appName in rule.AppNames ?? new List<string>())
                 {

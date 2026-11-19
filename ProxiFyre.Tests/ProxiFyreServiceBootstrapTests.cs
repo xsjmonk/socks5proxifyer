@@ -68,7 +68,7 @@ namespace ProxiFyre.Tests
             var root = RepositoryRoot;
             var program = File.ReadAllText(Path.Combine(root, "ProxiFyre", "Program.cs"));
 
-            StringAssert.Contains("new ProxiFyreService()", program);
+            StringAssert.Contains("new ProxiFyreService(", program);
             StringAssert.Contains("Service<ProxiFyreService>", program);
             StringAssert.Contains("new MainForm(service)", program);
         }
@@ -178,6 +178,25 @@ namespace ProxiFyre.Tests
             StringAssert.Contains("192.168.100.0/24", warnings[0]);
         }
 
+        [Test]
+        public void RuleHandlesAreIndexAlignedAndMarkInvalidNativeProxies()
+        {
+            var rules = new List<ProxyRule> {
+                new ProxyRule { Socks5ProxyEndpoint = "127.0.0.1:1080", AppNames = new List<string> { "a" } },
+                new ProxyRule { Socks5ProxyEndpoint = "127.0.0.1:1081", AppNames = new List<string> { "b" } }
+            };
+
+            var rejected = new ProxyRuleRegistrationCoordinator().Register(
+                rules, new FakeProxyEngine(new IntPtr(-1)), null, null, null);
+            Assert.That(rejected.RuleHandles.Count, Is.EqualTo(2));
+            Assert.That(rejected.RuleHandles[0].ToInt64(), Is.EqualTo(-1));
+            Assert.That(rejected.RuleHandles[1].ToInt64(), Is.EqualTo(-1));
+
+            var accepted = new ProxyRuleRegistrationCoordinator().Register(
+                rules, new FakeProxyEngine(new IntPtr(7)), null, null, null);
+            Assert.That(accepted.RuleHandles[0].ToInt64(), Is.EqualTo(7));
+            Assert.That(accepted.RuleHandles[1].ToInt64(), Is.EqualTo(7));
+        }
         [Test]
         public void RegistrationCoordinatorDoesNotUseInvalidHandlesOrPartialCredentials()
         {

@@ -98,18 +98,26 @@ if (-not [string]::IsNullOrWhiteSpace($ConfigurationPath)) {
     }
 }
 
-$exeBytes = [IO.File]::ReadAllBytes((Join-Path $root "ProxiFyre.exe"))
-$exeText = [Text.Encoding]::ASCII.GetString($exeBytes)
-$exeUnicodeText = [Text.Encoding]::Unicode.GetString($exeBytes)
-if ($exeText -notlike "*Required SOCKS5 proxy registration failed*" -and
-    $exeUnicodeText -notlike "*Required SOCKS5 proxy registration failed*") {
+# Search the raw bytes as Latin-1 so UTF-16 literals are found wherever the .NET #US heap
+# places them. Decoding the whole file as UTF-16 from byte 0 only matches literals that
+# start at an even offset, which yields false negatives.
+$latin1 = [Text.Encoding]::GetEncoding("iso-8859-1")
+function Test-BinaryContainsLiteral([string]$Path, [string]$Literal) {
+    $content = $latin1.GetString([IO.File]::ReadAllBytes($Path))
+    $pattern = $latin1.GetString([Text.Encoding]::Unicode.GetBytes($Literal))
+    return $content.Contains($pattern)
+}
+$engineExePath = Join-Path $root "ProxiFyre.exe"
+$configurationDllPath = Join-Path $root "ProxiFyre.Configuration.dll"
+if (-not (Test-BinaryContainsLiteral $engineExePath "Required SOCKS5 proxy registration failed")) {
     throw "ProxiFyre.exe does not contain the current required-failure guard."
 }
-if (($exeText -notlike "*Proxy rule*native proxy creation failed*") -and
-    ($exeUnicodeText -notlike "*Proxy rule*native proxy creation failed*")) {
-    throw "ProxiFyre.exe does not contain the current rule failure diagnostic."
+# The per-rule native failure text is owned by the shared configuration library, while the
+# engine owns the "Proxy rule" prefix, so both assemblies are checked.
+if (-not ((Test-BinaryContainsLiteral $engineExePath "Proxy rule") -and
+          (Test-BinaryContainsLiteral $configurationDllPath "native proxy creation failed"))) {
+    throw "The engine and configuration assembly do not contain the current rule failure diagnostic."
 }
-
 Write-Host "Artifact provenance passed: $root ($Configuration/$Platform)"
 Write-Host ("ArtifactProvenance path={0}; executable={1}; nativeDll={2}; configuration={3}." -f
     $root,

@@ -1,4 +1,5 @@
-﻿using System;
+using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -113,6 +114,8 @@ namespace ProxiFyre
             foreach (var excludedEntry in settings.Excludes ?? Enumerable.Empty<string>())
                 _socksify.ExcludeProcessName(excludedEntry);
 
+            ConfigureDnsRouting(settings, registration.RuleHandles);
+
             if (!_socksify.Start())
             {
                 var message = _useLimitedMode
@@ -140,6 +143,56 @@ namespace ProxiFyre
             finally
             {
                 LogManager.Shutdown();
+            }
+        }
+
+        /// <summary>
+        /// Applies the global DNS policy before the router starts. Direct mode lets DNS bypass
+        /// the proxies. Proxy mode routes DNS through the rule selected by dns.proxyId. Any
+        /// failure stops the start instead of sending DNS directly or through another proxy.
+        /// </summary>
+        private void ConfigureDnsRouting(ProxiFyreConfiguration settings, IList<IntPtr> ruleHandles)
+        {
+            DnsRoutingMode mode;
+            if (!DnsConfiguration.TryGetMode(settings.Dns == null ? null : settings.Dns.Mode, out mode))
+            {
+                var message = "DNS routing: the DNS mode '" + settings.Dns.Mode + "' is not recognized; use Direct or Proxy.";
+                LoggerInstance.Error(message);
+                throw new InvalidOperationException(message);
+            }
+
+            if (mode == DnsRoutingMode.Direct)
+            {
+                if (!_socksify.SetDnsRouting(DnsRoutingModeEnum.Direct, new IntPtr(-1), null))
+                    LoggerInstance.Warn("Failed to apply Direct DNS routing.");
+                else if (_logLevel >= SocksifierLogLevel.Info)
+                    LoggerInstance.Info("DNS routing: Direct - DNS (UDP/TCP port 53) bypasses the SOCKS5 proxies.");
+                return;
+            }
+
+            var dns = settings.Dns;
+            var ruleIndex = DnsConfiguration.FindProxyRuleIndex(settings.Proxies, dns.ProxyId);
+            var handle = ruleIndex >= 0 && ruleIndex < ruleHandles.Count ? ruleHandles[ruleIndex] : new IntPtr(-1);
+            if (handle == IntPtr.Zero || handle.ToInt64() == -1)
+            {
+                var message = "DNS routing: the DNS proxy '" + dns.ProxyId + "' has no usable SOCKS5 proxy handle. " +
+                              "The router was not started so that DNS is not sent directly or through another proxy.";
+                LoggerInstance.Error(message);
+                throw new InvalidOperationException(message);
+            }
+
+            if (!_socksify.SetDnsRouting(DnsRoutingModeEnum.Proxy, handle, dns.ServerOverride))
+            {
+                var message = "DNS routing: the engine rejected the Proxy mode configuration; the router was not started.";
+                LoggerInstance.Error(message);
+                throw new InvalidOperationException(message);
+            }
+
+            if (_logLevel >= SocksifierLogLevel.Info)
+            {
+                var serverOverride = string.IsNullOrWhiteSpace(dns.ServerOverride) ? "original destinations" : dns.ServerOverride;
+                LoggerInstance.Info("DNS routing: Proxy via '" + dns.ProxyId + "' (" +
+                                    settings.Proxies[ruleIndex].Socks5ProxyEndpoint + "), upstream DNS: " + serverOverride + ".");
             }
         }
 

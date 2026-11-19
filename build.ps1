@@ -283,8 +283,8 @@ function Get-RepositoryObjDirectories {
     param([string]$RepositoryRoot)
 
     $skipDirectoryNames = [System.Collections.Generic.HashSet[string]]::new(
-        [StringComparer]::OrdinalIgnoreCase,
-        @("Build", "Build.staging", "packages", ".git", "vcpkg_installed", "node_modules"))
+        [string[]]@("Build", "Build.staging", "packages", ".git", "vcpkg_installed", "node_modules"),
+        [StringComparer]::OrdinalIgnoreCase)
 
     $objDirectories = [System.Collections.Generic.List[string]]::new()
     $pending = [System.Collections.Queue]::new()
@@ -381,6 +381,9 @@ foreach ($entry in $outputRoots) {
     Copy-DirectoryContents -SourceDir $entry.Source -DestinationDir $entry.Destination
 }
 
+Write-Info "Deleting PDB and EXP files from Build folder"
+Get-ChildItem -Path $stagingDir -Include *.pdb,*.exp -Recurse -File | Remove-Item -Force
+
 Write-Info "Writing artifact provenance manifest"
 # Build\exe is the single launch/deployment unit. Keep the diagnostic copy in
 # Build\dll for inspection, but never require callers to mix trees manually.
@@ -395,9 +398,6 @@ if (-not [string]::IsNullOrWhiteSpace($ConfigurationPath)) {
 }
 Write-ArtifactManifest -DeploymentDirectory (Join-Path $stagingDir "exe") `
     -ConfigurationName $Configuration -PlatformName $Platform
-
-Write-Info "Deleting PDB and EXP files from Build folder"
-Get-ChildItem -Path $stagingDir -Include *.pdb,*.exp -Recurse -File | Remove-Item -Force
 
 Write-Info "Publishing complete artifact set"
 Remove-IfExists $buildDir
